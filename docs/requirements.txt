@@ -1,1 +1,2 @@
-Cython
+Cython>=3
+Sphinx>=7

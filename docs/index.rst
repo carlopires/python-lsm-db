@@ -6,14 +6,9 @@
 python lsm-db
 =============
 
-.. image:: http://media.charlesleifer.com/blog/photos/lsm.png
-
-Fast Python bindings for `SQLite's LSM key/value store <http://www.sqlite.org/src4/doc/trunk/www/lsmusr.wiki>`_.
-The LSM storage engine was initially written as part of the experimental
-SQLite4 rewrite (now abandoned). More recently, the LSM source code was moved
-into the SQLite3 `source tree <https://www.sqlite.org/cgi/src/dir?ci=e148cdad35520e66&name=ext/lsm1>`_
-and has seen some improvements and fixes. This project uses the LSM code from
-the SQLite3 source tree.
+Fast Python bindings for `SQLite's LSM1 key/value store
+<https://sqlite.org/src/dir?ci=trunk&name=ext/lsm1>`_. LSM1 originated in the
+experimental SQLite4 project and now lives in the SQLite source tree.
 
 Features:
 
@@ -21,14 +16,13 @@ Features:
 * Keys support in-order traversal using cursors.
 * Transactional (including nested transactions).
 * Single writer/multiple reader MVCC based transactional concurrency model.
-* On-disk database stored in a single file.
+* Checksummed transaction log and crash recovery.
 * Data is durable in the face of application or power failure.
 * Thread-safe.
-* Python 2.x and 3.x.
+* Python 3.9 and newer.
 
-Limitations:
-
-* Not tested on Windoze.
+The durable database is stored in one main file. While it is open, LSM1 also
+uses ``-log`` and ``-shm`` sidecar files for recovery and shared state.
 
 The source for Python lsm-db is `hosted on GitHub <https://github.com/coleifer/python-lsm-db>`_.
 
@@ -52,4 +46,3 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
-

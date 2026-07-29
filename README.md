@@ -1,251 +1,212 @@
-![Python LSM-DB](http://media.charlesleifer.com/blog/photos/lsm.png)
+# Python LSM-DB
 
-Fast Python bindings for [SQLite's LSM key/value store](http://www.sqlite.org/src4/doc/trunk/www/lsmusr.wiki).
-The LSM storage engine was initially written as part of the experimental
-SQLite4 rewrite (now abandoned). More recently, the LSM source code was moved
-into the SQLite3 [source tree](https://www.sqlite.org/cgi/src/dir?ci=e148cdad35520e66&name=ext/lsm1)
-and has seen some improvements and fixes. This project uses the LSM code from
-the SQLite3 source tree.
+Fast Python bindings for SQLite's
+[LSM1 key/value store](https://sqlite.org/src/dir?ci=trunk&name=ext/lsm1).
+LSM1 originated in the experimental SQLite4 project and now lives in the
+SQLite source tree. This package builds the engine and its Cython wrapper into
+a single native Python extension.
 
 Features:
 
-* Embedded zero-conf database.
-* Keys support in-order traversal using cursors.
-* Transactional (including nested transactions).
-* Single writer/multiple reader MVCC based transactional concurrency model.
-* On-disk database stored in a single file.
-* Data is durable in the face of application or power failure.
-* Thread-safe.
-* Python 2.x and 3.x.
+- Embedded, zero-configuration key/value database.
+- Ordered traversal and nearest-key lookups using cursors.
+- Nested transactions.
+- Single-writer/multiple-reader MVCC concurrency.
+- Checksummed transaction log and crash recovery.
+- Linux, macOS, and Windows wheel builds.
+- Python 3.9 and newer.
 
-Limitations:
+The durable database is stored in one main file. While a database is open,
+LSM1 also uses `-log` and `-shm` sidecar files for recovery and shared state.
+The sidecars are normally removed when the final connection closes cleanly.
 
-* Not tested on Windoze.
+## Installation
 
-The source for Python lsm-db is [hosted on GitHub](https://github.com/coleifer/python-lsm-db).
+Install a published wheel with pip:
 
-If you encounter any bugs in the library, please [open an issue](https://github.com/coleifer/python-lsm-db/issues/new),
-including a description of the bug and any related traceback.
-
-## Quick-start
-
-Below is a sample interactive console session designed to show some of the
-basic features and functionality of the ``lsm-db`` Python library. Also check
-out the [API documentation](https://lsm-db.readthedocs.io/en/latest/api.html).
-
-To begin, instantiate a `LSM` object, specifying a path to a database file.
-
-```python
-
->>> from lsm import LSM
->>> db = LSM('test.ldb')
+```console
+python -m pip install lsm-db
 ```
 
-### Key/Value Features
+Building from source requires a C compiler. Cython is installed automatically
+in pip's isolated build environment:
 
-`lsm-db` is a key/value store, and has a dictionary-like API:
-
-```python
-
->>> db['foo'] = 'bar'
->>> print db['foo']
-bar
-
->>> for i in range(4):
-...     db['k%s' % i] = str(i)
-...
-
->>> 'k3' in db
-True
->>> 'k4' in db
-False
-
->>> del db['k3']
->>> db['k3']
-Traceback (most recent call last):
-  File "<stdin>", line 1, in <module>
-  File "lsm.pyx", line 973, in lsm.LSM.__getitem__ (lsm.c:7142)
-  File "lsm.pyx", line 777, in lsm.LSM.fetch (lsm.c:5756)
-  File "lsm.pyx", line 778, in lsm.LSM.fetch (lsm.c:5679)
-  File "lsm.pyx", line 1289, in lsm.Cursor.seek (lsm.c:12122)
-  File "lsm.pyx", line 1311, in lsm.Cursor.seek (lsm.c:12008)
-KeyError: 'k3'
+```console
+git clone https://github.com/coleifer/python-lsm-db
+cd python-lsm-db
+python -m pip install .
 ```
 
-By default when you attempt to look up a key, ``lsm-db`` will search for an
-exact match. You can also search for the closest key, if the specific key you
-are searching for does not exist:
+## Quick start
+
+Create a database by passing its path to `LSM`:
 
 ```python
+from lsm import LSM
 
->>> from lsm import SEEK_LE, SEEK_GE
->>> db['k1xx', SEEK_LE]  # Here we will match "k1".
-'1'
->>> db['k1xx', SEEK_GE]  # Here we will match "k2".
-'2'
+db = LSM("test.ldb")
 ```
 
-`LSM` supports other common dictionary methods such as:
+### Keys and values
 
-* `keys()`
-* `values()`
-* `update()`
-
-### Slices and Iteration
-
-The database can be iterated through directly, or sliced. When you are slicing
-the database the start and end keys need not exist -- ``lsm-db`` will find the
-closest key (details can be found in the [LSM.fetch_range()](https://lsm-db.readthedocs.io/en/latest/api.html#lsm.LSM.fetch_range)
-documentation).
+The database has a dictionary-like API:
 
 ```python
+db["foo"] = "bar"
+assert db["foo"] == b"bar"
 
->>> [item for item in db]
-[('foo', 'bar'), ('k0', '0'), ('k1', '1'), ('k2', '2')]
+for i in range(4):
+    db[f"k{i}"] = str(i)
 
->>> db['k0':'k99']
-<generator object at 0x7f2ae93072f8>
+assert "k3" in db
+assert "k4" not in db
 
->>> list(db['k0':'k99'])
-[('k0', '0'), ('k1', '1'), ('k2', '2')]
+del db["k3"]
 ```
 
-You can use open-ended slices. If the lower- or upper-bound is outside the
-range of keys an empty list is returned.
+Strings are encoded as UTF-8. Retrieved keys and values are always `bytes`.
+Other input objects are converted to strings before being encoded; use
+`bytes` directly when an exact binary representation matters.
+
+Missing exact lookups raise `KeyError`. Nearest-key searches use `SEEK_LE`
+and `SEEK_GE`:
 
 ```python
+from lsm import SEEK_GE, SEEK_LE
 
->>> list(db['k0':])
-[('k0', '0'), ('k1', '1'), ('k2', '2')]
-
->>> list(db[:'k1'])
-[('foo', 'bar'), ('k0', '0'), ('k1', '1')]
-
->>> list(db[:'aaa'])
-[]
+assert db["k1xx", SEEK_LE] == b"1"
+assert db["k1xx", SEEK_GE] == b"2"
 ```
 
-To retrieve keys in reverse order, simply use a higher key as the first
-parameter of your slice. If you are retrieving an open-ended slice, you can
-specify ``True`` as the ``step`` parameter of the slice.
+`update()` inserts a dictionary of records:
 
 ```python
-
->>> list(db['k1':'aaa'])  # Since 'k1' > 'aaa', keys are retrieved in reverse:
-[('k1', '1'), ('k0', '0'), ('foo', 'bar')]
-
->>> list(db['k1'::True])  # Open-ended slices specify True for step:
-[('k1', '1'), ('k0', '0'), ('foo', 'bar')]
+db.update({"alpha": "a", "beta": "b"})
 ```
 
-You can also **delete** slices of keys, but note that the delete **will not**
-include the keys themselves:
+Each insertion is its own transaction unless `update()` is wrapped in an
+explicit transaction.
+
+### Slices and iteration
+
+Iteration yields `(key, value)` byte pairs in bytewise key order:
 
 ```python
+list(db)
+# [(b"alpha", b"a"), (b"beta", b"b"), (b"foo", b"bar"),
+#  (b"k0", b"0"), (b"k1", b"1"), (b"k2", b"2")]
+```
 
->>> del db['k0':'k99']
+Slices return generators and include both bounds:
 
->>> list(db)  # Note that 'k0' still exists.
-[('foo', 'bar'), ('k0', '0')]
+```python
+list(db["k0":"k9"])
+# [(b"k0", b"0"), (b"k1", b"1"), (b"k2", b"2")]
+
+list(db["k0":])
+list(db[:"k2"])
+```
+
+A descending pair of bounds selects reverse order. For an open-ended reverse
+slice, use `True` as the step:
+
+```python
+list(db["k2":"k0"])
+# [(b"k2", b"2"), (b"k1", b"1"), (b"k0", b"0")]
+
+list(db["k2"::True])
+```
+
+Slice deletion excludes the boundary keys:
+
+```python
+del db["k0":"k9"]
 ```
 
 ### Cursors
 
-While slicing may cover most use-cases, for finer-grained control you can use
-cursors for traversing records.
+Cursors provide explicit control over traversal:
 
 ```python
+with db.cursor() as cursor:
+    for key, value in cursor:
+        print(key, value)
 
->>> with db.cursor() as cursor:
-...     for key, value in cursor:
-...         print key, '=>', value
-...
-foo => bar
-k0 => 0
-
->>> db.update({'k1': '1', 'k2': '2', 'k3': '3'})
-
->>> with db.cursor() as cursor:
-...     cursor.first()
-...     print cursor.key()
-...     cursor.last()
-...     print cursor.key()
-...     cursor.previous()
-...     print cursor.key()
-...
-foo
-k3
-k2
-
->>> with db.cursor() as cursor:
-...     cursor.seek('k0', SEEK_GE)
-...     print list(cursor.fetch_until('k99'))
-...
-[('k0', '0'), ('k1', '1'), ('k2', '2'), ('k3', '3')]
+with db.cursor() as cursor:
+    cursor.seek("k0", SEEK_GE)
+    rows = list(cursor.fetch_until("k99"))
 ```
 
-It is very important to close a cursor when you are through using it. For this
-reason, it is recommended you use the `LSM.cursor()` context-manager, which
-ensures the cursor is closed properly.
+Always close cursors. A database cannot close while any of its cursors remain
+open, so using the cursor context manager is recommended.
 
 ### Transactions
 
-``lsm-db`` supports nested transactions. The simplest way to use transactions
-is with the `LSM.transaction()` method, which doubles as a context-manager or
-decorator.
+Transactions may be nested:
 
 ```python
+with db.transaction():
+    db["k1"] = "outer"
 
->>> with db.transaction() as txn:
-...     db['k1'] = '1-mod'
-...     with db.transaction() as txn2:
-...         db['k2'] = '2-mod'
-...         txn2.rollback()
-...
-True
->>> print db['k1'], db['k2']
-1-mod 2
+    with db.transaction() as nested:
+        db["k2"] = "nested"
+        nested.rollback()
+
+assert db["k1"] == b"outer"
+assert "k2" not in db
 ```
 
-You can commit or roll-back transactions part-way through a wrapped block:
+`transaction()` can also decorate a function. A normal return commits and an
+exception rolls back:
 
 ```python
-
->>> with db.transaction() as txn:
-...    db['k1'] = 'outer txn'
-...    txn.commit()  # The write is preserved.
-...
-...    db['k1'] = 'outer txn-2'
-...    with db.transaction() as txn2:
-...        db['k1'] = 'inner-txn'  # This is commited after the block ends.
-...    print db['k1']  # Prints "inner-txn".
-...    txn.rollback()  # Rolls back both the changes from txn2 and the preceding write.
-...    print db['k1']
-...
-1              <- Return value from call to commit().
-inner-txn      <- Printed after end of txn2.
-True           <- Return value of call to rollback().
-outer txn      <- Printed after rollback.
+@db.transaction()
+def store_pair(key1, value1, key2, value2):
+    db[key1] = value1
+    db[key2] = value2
 ```
 
-If you like, you can also explicitly call `LSM.begin()`, `LSM.commit()`, and
-`LSM.rollback()`.
+Explicit `begin()`, `commit()`, and `rollback()` methods are available when a
+context manager is not suitable.
 
-```python
+### Maintenance and tuning
 
->>> db.begin()
->>> db['foo'] = 'baze'
->>> print db['foo']
-baze
->>> db.rollback()
-True
->>> print db['foo']
-bar
+The most commonly used tuning properties are:
+
+- `autoflush`: live in-memory tree limit in KB; default 1024.
+- `autocheckpoint`: automatic checkpoint interval in KB; default 2048.
+- `automerge`: target number of segments merged at once; default 4.
+- `autowork`: automatically flush and merge during writes; enabled by
+  default.
+- `write_safety`: `SAFETY_OFF`, `SAFETY_NORMAL`, or `SAFETY_FULL`.
+- `transaction_log`: enable the recovery log; enabled by default.
+- `multiple_processes`: enable file locking and shared state; enabled by
+  default.
+- `mmap`: configure memory-mapped reads.
+
+Applications that disable automatic work should schedule `flush()`, `work()`,
+and `checkpoint()` themselves. `checkpoint()` returns the number of KB made
+durable in the database file.
+
+## Development
+
+Run the tests from an installed source checkout:
+
+```console
+python tests.py
 ```
 
-### Reading more
+Build the documentation with:
 
-For more information, check out the project's documentation, hosted at
-readthedocs:
+```console
+python -m pip install -r docs/requirements.txt
+sphinx-build -W -b html docs docs/_build/html
+```
 
-https://lsm-db.readthedocs.io/en/latest/
+The complete API reference is available at
+https://lsm-db.readthedocs.io/en/latest/api.html.
+
+## License
+
+The Python wrapper is distributed under the MIT License. The vendored SQLite
+LSM1 sources are in the public domain. See `LICENSE` and `SQLITE_LICENSE`.

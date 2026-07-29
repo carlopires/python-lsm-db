@@ -334,6 +334,13 @@ class TestLSM(BaseTestLSM):
         self.assertEqual(self.db.incr('i0'), 2)
         self.assertEqual(self.db.incr('i0'), 3)
 
+    def test_checkpoint(self):
+        self.db['key'] = 'value'
+        self.assertIsInstance(self.db.checkpoint(), int)
+
+        # The legacy, ignored argument remains accepted for compatibility.
+        self.assertIsInstance(self.db.checkpoint(0), int)
+
     def test_data_types(self):
         key = b('k\xe2\x80\x941')
         self.db[key] = key
@@ -472,6 +479,17 @@ class TestTransactions(BaseTestLSM):
         self.assertBEqual(self.db['k1'], 'v1')
         self.assertBEqual(self.db['k2'], 'v2')
 
+    def test_failed_begin_preserves_depth(self):
+        self.db['key'] = 'value'
+        self.db.close()
+
+        readonly_db = lsm.LSM(self.filename, readonly=True)
+        try:
+            self.assertRaises(IOError, readonly_db.begin)
+            self.assertEqual(readonly_db.transaction_depth, 0)
+        finally:
+            readonly_db.close()
+
 
 class TestCursors(BaseTestLSM):
     def setUp(self):
@@ -566,6 +584,12 @@ class TestCursors(BaseTestLSM):
 
         with self.db.cursor(True) as cursor:
             self.assertRaises(KeyError, cursor.seek, 'missing')
+
+    def test_invalid_cursor_access(self):
+        with self.db.cursor() as cursor:
+            self.assertRaises(KeyError, cursor.seek, 'missing')
+            self.assertRaises(Exception, cursor.key)
+            self.assertRaises(Exception, cursor.value)
 
     def test_seek_missing_for_iteration(self):
         with self.db.cursor() as cursor:

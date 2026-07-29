@@ -41,6 +41,7 @@ API Documentation
       __reversed__,
       keys,
       values,
+      incr,
       flush,
       work,
       checkpoint,
@@ -83,18 +84,18 @@ Constants
 Seek methods, can be used when fetching records or slices.
 
 ``SEEK_EQ``
-  The cursor is left at EOF (invalidated). A call to lsm_csr_valid()
-  returns non-zero.
+  Match the key exactly. If the key does not exist, the cursor is left at EOF
+  (invalidated) and :py:meth:`Cursor.is_valid` returns ``False``.
 
 ``SEEK_LE``
-  The cursor is left pointing to the largest key in the database that
-  is smaller than (pKey/nKey). If the database contains no keys smaller
-  than (pKey/nKey), the cursor is left at EOF.
+  Match the key exactly or leave the cursor pointing to the largest key that
+  precedes it. If the database contains no such key, the cursor is left at
+  EOF.
 
 ``SEEK_GE``
-  The cursor is left pointing to the smallest key in the database that
-  is larger than (pKey/nKey). If the database contains no keys larger
-  than (pKey/nKey), the cursor is left at EOF.
+  Match the key exactly or leave the cursor pointing to the smallest key that
+  follows it. If the database contains no such key, the cursor is left at
+  EOF.
 
 If the fourth parameter is ``SEEK_LEFAST``, this function searches the
 database in a similar manner to ``SEEK_LE``, with two differences:
@@ -111,7 +112,7 @@ in the database that is less than or equal to (pKey/nKey).
 ``SEEK_LEFAST`` requests are intended to be used to allocate database
 keys.
 
-Used in calls to :py:meth:`LSM.set_safety`.
+Values accepted by the :py:attr:`LSM.write_safety` property:
 
 * ``SAFETY_OFF``
 * ``SAFETY_NORMAL``

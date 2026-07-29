@@ -14,14 +14,15 @@ The project is hosted at https://github.com/coleifer/python-lsm-db and can be in
 .. code-block:: console
 
     git clone https://github.com/coleifer/python-lsm-db
-    cd lsm-db
-    python setup.py build
-    python setup.py install
+    cd python-lsm-db
+    python -m pip install .
 
 .. note::
-    ``lsm-db`` depends on `Cython <http://www.cython.org/>`_ to generate the Python extension. By default, lsm-db ships with a pre-generated C source file, so it is not strictly necessary to install Cython in order to compile ``lsm-db``, but you may wish to install Cython to ensure the generated source is compatible with your setup.
+    Building from source requires a C compiler. Cython is declared as a build
+    dependency and is installed automatically by modern versions of ``pip``
+    in an isolated build environment.
 
-After installing lsm-db, you can run the unit tests by executing the ``tests`` module:
+After installing lsm-db, run the unit tests from a source checkout:
 
 .. code-block:: console
 

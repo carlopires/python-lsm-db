@@ -119,7 +119,7 @@ cdef extern from "src/lsm.h" nogil:
     #
     # LSM_SEEK_EQ:
     #   The cursor is left at EOF (invalidated). A call to lsm_csr_valid()
-    #   returns non-zero.
+    #   returns zero.
     #
     # LSM_SEEK_LE:
     #   The cursor is left pointing to the largest key in the database that
@@ -224,8 +224,9 @@ cdef inline int ensure_bytes(obj) except -1:
 cdef inline _check(int rc):
     """Check the return value of a call to an LSM function."""
     if rc != LSM_OK:
-        exc_class = EXC_MAPPING.get(rc, Exception)
-        raise exc_class(EXC_MESSAGE_MAPPING.get(rc, 'Unknown error'))
+        base_rc = rc & 0xff
+        exc_class = EXC_MAPPING.get(base_rc, Exception)
+        raise exc_class(EXC_MESSAGE_MAPPING.get(base_rc, 'Unknown error'))
 
 cdef bint IS_PY3K = sys.version_info[0] == 3
 
@@ -267,9 +268,9 @@ def option(name, lsm_flag, bool_to_int=False, pre_open=False):
 
 cdef class LSM(object):
     """
-    Python wrapper for SQLite4's LSM implementation.
+    Python wrapper for SQLite's LSM1 key/value store.
 
-    http://www.sqlite.org/src4/doc/trunk/www/lsmapi.wiki
+    https://sqlite.org/src/dir?ci=trunk&name=ext/lsm1
 
     Performance notes
     ^^^^^^^^^^^^^^^^^
@@ -359,7 +360,7 @@ cdef class LSM(object):
         self.was_opened = False
 
     def __dealloc__(self):
-        if self.is_open and self.db:
+        if self.db:
             lsm_close(self.db)
 
     def __init__(self, filename, open_database=True, **options):
@@ -399,12 +400,17 @@ cdef class LSM(object):
             return False
 
         _check(lsm_new(NULL, &self.db))
+        try:
+            # Configure the handle with any requested options before opening.
+            for key, value in self._options.items():
+                setattr(self, key, value)
 
-        # Configure database handle with any default configuration values.
-        for key, value in self._options.items():
-            setattr(self, key, value)
+            _check(lsm_open(self.db, filename))
+        except:
+            lsm_close(self.db)
+            self.db = <lsm_db *>0
+            raise
 
-        _check(lsm_open(self.db, filename))
         self.is_open = True
         self.was_opened = True
         return True
@@ -650,10 +656,8 @@ cdef class LSM(object):
         other tree structure - the old tree - is a read-only tree holding
         older data and may be flushed to disk at any time.
 
-        Assuming no error occurs, the location pointed to by the first of the
-        two (int *) arguments is set to the size of the old in-memory tree in
-        KB. The second is set to the size of the current, or live in-memory
-        tree.
+        Returns a two-item tuple containing the sizes, in KB, of the old
+        in-memory tree and the current live tree.
         """
         cdef int t1, t2
         _check(lsm_info(self.db, LSM_INFO_TREE_SIZE, &t1, &t2))
@@ -692,7 +696,6 @@ cdef class LSM(object):
             bytes bvalue = encode(value)
             char *kbuf
             char *vbuf
-            int rc
             Py_ssize_t klen, vlen
 
         PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
@@ -759,7 +762,6 @@ cdef class LSM(object):
             bytes bkey = encode(key)
             char *kbuf
             char *vbuf
-            int rc
             int vlen
             Py_ssize_t klen
 
@@ -768,14 +770,13 @@ cdef class LSM(object):
         # Use low-level cursor APIs for performance, since this method could
         # be a hot-spot. Another idea is to use a cursor cache or a shared
         # cursor context. Or the method could accept a cursor as a parameter.
-        lsm_csr_open(self.db, &pcursor)
+        _check(lsm_csr_open(self.db, &pcursor))
         try:
-            rc = lsm_csr_seek(pcursor, <void *>kbuf, klen, seek_method)
-            if rc == LSM_OK and lsm_csr_valid(pcursor):
-                rc = lsm_csr_value(pcursor, <const void **>(&vbuf), &vlen)
-                if rc == LSM_OK:
-                    return vbuf[:vlen]
-            raise KeyError(key)
+            _check(lsm_csr_seek(pcursor, <void *>kbuf, klen, seek_method))
+            if not lsm_csr_valid(pcursor):
+                raise KeyError(key)
+            _check(lsm_csr_value(pcursor, <const void **>(&vbuf), &vlen))
+            return vbuf[:vlen]
         finally:
             lsm_csr_close(pcursor)
 
@@ -793,22 +794,22 @@ cdef class LSM(object):
             char *kbuf
             char *vbuf
             dict accum = {}
-            int rc
             int vlen
             Py_ssize_t klen
 
-        lsm_csr_open(self.db, &pcursor)
+        _check(lsm_csr_open(self.db, &pcursor))
 
         try:
             for key in keys:
                 bkey = encode(key)
                 PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
 
-                rc = lsm_csr_seek(pcursor, <void *>kbuf, klen, seek_method)
-                if rc == LSM_OK and lsm_csr_valid(pcursor):
-                    rc = lsm_csr_value(pcursor, <const void **>(&vbuf), &vlen)
-                    if rc == LSM_OK:
-                        accum[key] = vbuf[:vlen]
+                _check(lsm_csr_seek(
+                    pcursor, <void *>kbuf, klen, seek_method))
+                if lsm_csr_valid(pcursor):
+                    _check(lsm_csr_value(
+                        pcursor, <const void **>(&vbuf), &vlen))
+                    accum[key] = vbuf[:vlen]
         finally:
             lsm_csr_close(pcursor)
 
@@ -1231,16 +1232,19 @@ cdef class LSM(object):
         _check(rc)
         return nbytes_written
 
-    cpdef int checkpoint(self, int nkb) except -1:
+    cpdef int checkpoint(self, _unused=None) except -1:
         """
-        Write to the database file header. If the current snapshot has already
-        been checkpointed, calling this function is a no-op. In this case if
-        pnKB is not NULL, *nkb is set to 0. Or, if the current snapshot is
-        successfully checkpointed by this function and pbKB is not NULL, *nkb
-        is set to the number of bytes written to the database file since the
-        previous checkpoint (the same measure as returned by the
-        LSM_INFO_CHECKPOINT_SIZE query).
+        Checkpoint the current snapshot to the database file header.
+
+        If the snapshot has already been checkpointed, this method is a no-op
+        and returns 0. Otherwise it returns the number of KB written to the
+        database since the previous checkpoint, using the same measure as
+        :py:meth:`checkpoint_size`.
+
+        The optional argument is ignored and retained only for compatibility
+        with older releases.
         """
+        cdef int nkb = 0
         _check(lsm_checkpoint(self.db, &nkb))
         return nkb
 
@@ -1253,13 +1257,20 @@ cdef class LSM(object):
             In most cases it is preferable to use the :py:meth:`transaction`
             context manager/decorator.
         """
-        self.transaction_depth += 1
-        _check(lsm_begin(self.db, self.transaction_depth))
+        cdef int new_depth = self.transaction_depth + 1
+        _check(lsm_begin(self.db, new_depth))
+        self.transaction_depth = new_depth
 
     cdef int _commit(self) except -1:
+        cdef int new_depth
+        cdef int rc
         if self.transaction_depth > 0:
-            self.transaction_depth -= 1
-            _check(lsm_commit(self.db, self.transaction_depth))
+            new_depth = self.transaction_depth - 1
+            rc = lsm_commit(self.db, new_depth)
+            # lsm_commit() closes the requested transaction level even if
+            # finalizing the outer transaction reports an error.
+            self.transaction_depth = new_depth
+            _check(rc)
             return 1
         return 0
 
@@ -1272,10 +1283,15 @@ cdef class LSM(object):
         return self._commit() and True or False
 
     cdef int _rollback(self, bint keep_transaction) except -1:
+        cdef int new_depth
+        cdef int rc
         if self.transaction_depth > 0:
+            new_depth = self.transaction_depth
             if not keep_transaction:
-                self.transaction_depth -= 1
-            _check(lsm_rollback(self.db, self.transaction_depth))
+                new_depth -= 1
+            rc = lsm_rollback(self.db, new_depth)
+            self.transaction_depth = new_depth
+            _check(rc)
             return 1
         return 0
 
@@ -1371,9 +1387,7 @@ cdef class Cursor(object):
     ``previous()`` is called, ``LSM_MISUSE`` is returned and the cursor
     position remains unchanged.
 
-    For more information, see:
-
-    http://www.sqlite.org/src4/doc/trunk/www/lsmusr.wiki#reading_from_a_database
+    The underlying cursor API is defined in SQLite's ``ext/lsm1/lsm.h``.
     """
     cdef:
         LSM lsm
@@ -1385,7 +1399,8 @@ cdef class Cursor(object):
     def __cinit__(self, LSM lsm, bint reverse):
         self.lsm = lsm
         self.cursor = <lsm_cursor *>0
-        lsm_csr_open(self.lsm.db, &self.cursor)
+        self.is_open = False
+        _check(lsm_csr_open(self.lsm.db, &self.cursor))
         self.is_open = True
         self._consumed = False
         self._reverse = reverse
@@ -1410,7 +1425,7 @@ cdef class Cursor(object):
     def open(self):
         return self._open() and True or False
 
-    cdef int _close(self):
+    cdef int _close(self) except -1:
         """
         Close the cursor.
 
@@ -1427,7 +1442,8 @@ cdef class Cursor(object):
         if not self.is_open:
             return 0
 
-        lsm_csr_close(self.cursor)
+        _check(lsm_csr_close(self.cursor))
+        self.cursor = <lsm_cursor *>0
         self.is_open = False
         return 1
 
@@ -1458,8 +1474,6 @@ cdef class Cursor(object):
         return self
 
     def __next__(self):
-        cdef int rc
-
         if self._consumed:
             raise StopIteration
 
@@ -1511,15 +1525,12 @@ cdef class Cursor(object):
             the database that is *larger* than the given key. If no larger key
             exists, then a ``KeyError`` will be raised.
 
-        For more details, read:
-
-        http://www.sqlite.org/src4/doc/trunk/www/lsmapi.wiki#lsm_csr_seek
+        The underlying seek API is defined in SQLite's ``ext/lsm1/lsm.h``.
         """
         cdef:
             bytes bkey = encode(key)
             char *kbuf
             Py_ssize_t klen
-            int rc
 
         PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
 
@@ -1647,7 +1658,9 @@ cdef class Cursor(object):
             char *k
             int klen
 
-        lsm_csr_key(self.cursor, <const void **>(&k), &klen)
+        if not self.is_valid():
+            _check(LSM_MISUSE)
+        _check(lsm_csr_key(self.cursor, <const void **>(&k), &klen))
         return k[:klen]
 
     cdef inline _value(self):
@@ -1656,7 +1669,9 @@ cdef class Cursor(object):
             char *v
             int vlen
 
-        lsm_csr_value(self.cursor, <const void **>(&v), &vlen)
+        if not self.is_valid():
+            _check(LSM_MISUSE)
+        _check(lsm_csr_value(self.cursor, <const void **>(&v), &vlen))
         return v[:vlen]
 
     def key(self):
