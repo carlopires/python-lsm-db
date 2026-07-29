@@ -42,9 +42,17 @@ Missing exact lookups raise :class:`KeyError`. Use :data:`lsm.SEEK_LE` and
     >>> db['k1xx', SEEK_GE]
     b'2'
 
-Each call to :py:meth:`lsm.LSM.insert` is its own transaction unless it is
-already inside an explicit transaction. Wrap :py:meth:`lsm.LSM.update` in a
-transaction when the complete batch must be atomic.
+Use :py:meth:`lsm.LSM.insert_many` for an atomic bulk insert. It accepts a
+mapping or an iterable of ``(key, value)`` pairs, streams the input, and
+returns the number of rows inserted:
+
+.. code-block:: python
+
+    rows = ((f'key-{i}', f'value-{i}') for i in range(10_000))
+    assert db.insert_many(rows) == 10_000
+
+If conversion or insertion fails, the complete batch is rolled back.
+:py:meth:`lsm.LSM.update` provides the same atomic behavior for mappings.
 
 Slices and iteration
 --------------------
@@ -133,6 +141,18 @@ commits and an exception rolls back:
 Explicit :py:meth:`lsm.LSM.begin`, :py:meth:`lsm.LSM.commit`, and
 :py:meth:`lsm.LSM.rollback` methods are available when a context manager is
 not suitable.
+
+Threads
+-------
+
+Potentially blocking database, cursor, and maintenance operations release the
+GIL. Each connection serializes access with a re-entrant lock. A transaction
+owns its connection until its outermost commit or rollback, preventing other
+threads from interleaving work with it.
+
+Use one :py:class:`lsm.LSM` connection per worker thread when actual overlap
+is desired. LSM1 permits concurrent readers but still has a single-writer
+model.
 
 Maintenance
 -----------

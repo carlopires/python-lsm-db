@@ -94,29 +94,31 @@ Notable behavior:
   end.
 - `SEEK_EQ`, `SEEK_LE`, `SEEK_GE`, and `SEEK_LEFAST` are exposed.
 - Individual writes automatically get their own transaction.
-- `update()` is a loop of independently committed inserts unless wrapped in
-  `with db.transaction():`.
+- `insert_many()` streams a mapping or iterable of pairs through one atomic
+  nested transaction and returns the inserted row count.
+- `update()` delegates mappings to the same atomic bulk path.
 - Nested transactions are implemented with tree and log marks.
 - `incr()` stores a signed 64-bit big-endian integer, but its declared return
   type is only a C `int`.
 
-The configuration/property machinery starts around `lsm.pyx:243`,
-dictionary/range behavior around `lsm.pyx:817`, and transactions around
-`lsm.pyx:1247`.
+The configuration/property machinery, dictionary/range behavior, and
+transaction implementation all live in [`lsm.pyx`](lsm.pyx).
 
 ## Concurrency
 
 The underlying model is single-writer/multiple-reader with file locks and
 shared-memory snapshots across processes.
 
-Within Python, calls currently retain the GIL. The C platform layer also
-defaults to no-op native mutexes because the build does not define
-`LSM_MUTEX_PTHREADS` or `LSM_MUTEX_WIN32`. Consequently, ordinary Python
-builds are effectively protected by GIL serialization, but operations do not
-execute concurrently in separate Python threads.
+The build enables SQLite LSM1's pthread mutexes on Unix and native mutexes on
+Windows. Potentially blocking database, cursor, and maintenance operations
+release the GIL. Each Python connection also has a re-entrant lock, and an
+open transaction retains ownership of that lock until its outermost commit or
+rollback. This prevents calls on another thread from interleaving with a
+transaction or racing connection lifetime.
 
-This matters because `work()` recommends running maintenance in a background
-thread, yet the call holds the GIL and can still stall other Python threads.
+Separate connections are still recommended for worker threads that need
+actual overlap. The engine permits concurrent readers but retains its
+single-writer model.
 
 ## Verification
 
@@ -124,12 +126,13 @@ An isolated PEP 517 wheel was built on Python 3.14.4:
 
 - The wheel built successfully.
 - The native extension imported successfully.
-- All 36 tests passed in 0.012 seconds after the maintenance changes.
+- All 42 tests passed after the bulk-write and concurrency changes.
 - The working checkout remained untouched during exploration.
 
-The tests cover dictionary behavior, range traversal, cursors, nested
-transactions, configuration, information counters, and an eight-thread write
-test. CI runs them on Linux with Python 3.9, 3.10, 3.12, and 3.14 through
+The tests cover dictionary behavior, atomic bulk writes, range traversal,
+cursors, nested transactions, transaction ownership, configuration,
+information counters, and an eight-thread write test. CI runs them on Linux
+with Python 3.9, 3.10, 3.12, and 3.14 through
 [`.github/workflows/tests.yaml`](.github/workflows/tests.yaml). Tagged
 releases build Linux, macOS, and Windows wheels and publish directly to PyPI
 through [`.github/workflows/wheels.yaml`](.github/workflows/wheels.yaml).
@@ -181,14 +184,14 @@ semantics, and the current project version.
 ### 7. Important reliability scenarios are untested
 
 There are still no tests for crash recovery, power-loss simulations,
-multi-process access, sustained flush/merge workloads, or actual runtime
-behavior on macOS/Windows. Non-Linux platforms are built on release tags but
-not tested.
+multi-process access, or sustained flush/merge workloads. Release-tag wheel
+builds run the suite on Linux, macOS, and Windows, but non-Linux platforms are
+not tested on every push.
 
 ## Overall assessment
 
 The core engine is sophisticated and the public wrapper is pleasantly small.
 The happy path is solid and fast, including current Python 3.14 support. The
 maintenance pass resolved the main wrapper-boundary, packaging, licensing,
-and documentation issues found during the audit. Concurrency expectations and
-the remaining reliability test gaps deserve further work.
+bulk-write, GIL, mutex, and documentation issues found during the audit. The
+remaining reliability test gaps deserve further work.

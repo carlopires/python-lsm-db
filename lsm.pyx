@@ -6,6 +6,7 @@ from cpython.unicode cimport PyUnicode_Check
 from cpython.version cimport PY_MAJOR_VERSION
 import struct
 import sys
+from threading import RLock, get_ident
 
 try:
     from os import fsencode
@@ -248,7 +249,8 @@ def option(name, lsm_flag, bool_to_int=False, pre_open=False):
     OPTIONS.add(name)
     def _getter(LSM self):
         cdef int i = -1
-        _check(lsm_config(self.db, lsm_flag, &i))
+        with self._lock:
+            _check(lsm_config(self.db, lsm_flag, &i))
         return i
 
     def _setter(LSM self, value):
@@ -260,8 +262,9 @@ def option(name, lsm_flag, bool_to_int=False, pre_open=False):
             i = value and 1 or 0
         else:
             i = value
-        _check(lsm_config(self.db, lsm_flag, &i))
-        self._options[name] = value
+        with self._lock:
+            _check(lsm_config(self.db, lsm_flag, &i))
+            self._options[name] = value
         return i
     return property(_getter, _setter)
 
@@ -349,12 +352,16 @@ cdef class LSM(object):
         bint was_opened
         bytes encoded_filename
         dict _options
+        object _lock
+        object _transaction_owner
         readonly bint is_open
         readonly int transaction_depth
         readonly filename
 
     def __cinit__(self):
         self.db = <lsm_db *>0
+        self._lock = RLock()
+        self._transaction_owner = None
         self.is_open = False
         self.transaction_depth = 0
         self.was_opened = False
@@ -395,25 +402,33 @@ cdef class LSM(object):
         """
         cdef:
             char *filename = self.encoded_filename
+            int rc
 
-        if self.is_open:
-            return False
+        with self._lock:
+            if self.is_open:
+                return False
 
-        _check(lsm_new(NULL, &self.db))
-        try:
-            # Configure the handle with any requested options before opening.
-            for key, value in self._options.items():
-                setattr(self, key, value)
+            with nogil:
+                rc = lsm_new(NULL, &self.db)
+            _check(rc)
+            try:
+                # Configure the handle before opening it. The option setters
+                # re-enter this connection lock.
+                for key, value in self._options.items():
+                    setattr(self, key, value)
 
-            _check(lsm_open(self.db, filename))
-        except:
-            lsm_close(self.db)
-            self.db = <lsm_db *>0
-            raise
+                with nogil:
+                    rc = lsm_open(self.db, filename)
+                _check(rc)
+            except:
+                with nogil:
+                    lsm_close(self.db)
+                self.db = <lsm_db *>0
+                raise
 
-        self.is_open = True
-        self.was_opened = True
-        return True
+            self.is_open = True
+            self.was_opened = True
+            return True
 
     cpdef close(self):
         """
@@ -427,17 +442,19 @@ cdef class LSM(object):
         """
         cdef int rc
 
-        if not self.is_open:
-            return False
+        with self._lock:
+            if not self.is_open:
+                return False
 
-        rc = lsm_close(self.db)
-        if rc in (LSM_BUSY, LSM_MISUSE):
-            raise IOError('Unable to close database, one or more '
-                          'cursors may still be in use.')
-        self.db = <lsm_db *>0
-        self.is_open = False
-        _check(rc)
-        return True
+            with nogil:
+                rc = lsm_close(self.db)
+            if rc in (LSM_BUSY, LSM_MISUSE):
+                raise IOError('Unable to close database, one or more '
+                              'cursors may still be in use.')
+            self.db = <lsm_db *>0
+            self.is_open = False
+            _check(rc)
+            return True
 
     page_size = option('page_size', LSM_CONFIG_PAGE_SIZE, pre_open=True)
     """
@@ -625,7 +642,8 @@ cdef class LSM(object):
         lifetime of this connection.
         """
         cdef int npages
-        _check(lsm_info(self.db, LSM_INFO_NWRITE, &npages))
+        with self._lock:
+            _check(lsm_info(self.db, LSM_INFO_NWRITE, &npages))
         return npages
 
     cpdef int pages_read(self):
@@ -634,7 +652,8 @@ cdef class LSM(object):
         lifetime of this connection.
         """
         cdef int npages
-        _check(lsm_info(self.db, LSM_INFO_NREAD, &npages))
+        with self._lock:
+            _check(lsm_info(self.db, LSM_INFO_NREAD, &npages))
         return npages
 
     cpdef int checkpoint_size(self):
@@ -643,7 +662,8 @@ cdef class LSM(object):
         checkpoint.
         """
         cdef int nkb
-        _check(lsm_info(self.db, LSM_INFO_CHECKPOINT_SIZE, &nkb))
+        with self._lock:
+            _check(lsm_info(self.db, LSM_INFO_CHECKPOINT_SIZE, &nkb))
         return nkb
 
     cpdef tuple tree_size(self):
@@ -660,7 +680,8 @@ cdef class LSM(object):
         in-memory tree and the current live tree.
         """
         cdef int t1, t2
-        _check(lsm_info(self.db, LSM_INFO_TREE_SIZE, &t1, &t2))
+        with self._lock:
+            _check(lsm_info(self.db, LSM_INFO_TREE_SIZE, &t1, &t2))
         return (t1, t2)
 
     def __enter__(self):
@@ -696,29 +717,82 @@ cdef class LSM(object):
             bytes bvalue = encode(value)
             char *kbuf
             char *vbuf
+            int rc
             Py_ssize_t klen, vlen
 
         PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
         PyBytes_AsStringAndSize(bvalue, &vbuf, &vlen)
 
-        _check(lsm_insert(
-            self.db,
-            kbuf,
-            klen,
-            vbuf,
-            vlen))
+        with self._lock:
+            with nogil:
+                rc = lsm_insert(
+                    self.db,
+                    kbuf,
+                    klen,
+                    vbuf,
+                    vlen)
+            _check(rc)
 
-    cpdef update(self, dict values):
+    def insert_many(self, rows):
         """
-        Add an arbitrary number of key/value pairs. Unlike the Python
-        ``dict.update`` method, :py:meth:`~LSM.update` does not accept
-        arbitrary keyword arguments and only takes a single dictionary as
-        the parameter.
+        Atomically insert an iterable of ``(key, value)`` pairs.
 
-        :param dict values: A dictionary of key/value pairs.
+        A mapping may be supplied directly. The batch uses one nested
+        transaction, streams its input without materializing it, and rolls
+        back all rows if conversion or insertion fails.
+
+        :returns: Number of rows inserted.
         """
-        for key in values:
-            self.insert(key, values[key])
+        cdef:
+            bytes bkey
+            bytes bvalue
+            char *kbuf
+            char *vbuf
+            int rc
+            Py_ssize_t count = 0
+            Py_ssize_t klen, vlen
+
+        if hasattr(rows, 'items'):
+            rows = rows.items()
+
+        self.begin()
+        try:
+            for key, value in rows:
+                bkey = encode(key)
+                bvalue = encode(value)
+                PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
+                PyBytes_AsStringAndSize(bvalue, &vbuf, &vlen)
+
+                # begin() retains the re-entrant connection lock for the
+                # lifetime of this transaction, so the handle and buffers are
+                # stable while Python executes other threads.
+                with nogil:
+                    rc = lsm_insert(
+                        self.db,
+                        kbuf,
+                        klen,
+                        vbuf,
+                        vlen)
+                _check(rc)
+                count += 1
+        except:
+            self._rollback(False)
+            raise
+        else:
+            self._commit()
+
+        return count
+
+    def update(self, values):
+        """
+        Atomically add the key/value pairs from a mapping.
+
+        Unlike the Python ``dict.update`` method, this method does not accept
+        arbitrary keyword arguments.
+
+        :param values: A mapping of key/value pairs.
+        """
+        self.insert_many(values.items())
 
     cpdef fetch(self, key, int seek_method=LSM_SEEK_EQ):
         """
@@ -762,23 +836,33 @@ cdef class LSM(object):
             bytes bkey = encode(key)
             char *kbuf
             char *vbuf
+            int rc
             int vlen
             Py_ssize_t klen
 
         PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
 
-        # Use low-level cursor APIs for performance, since this method could
-        # be a hot-spot. Another idea is to use a cursor cache or a shared
-        # cursor context. Or the method could accept a cursor as a parameter.
-        _check(lsm_csr_open(self.db, &pcursor))
-        try:
-            _check(lsm_csr_seek(pcursor, <void *>kbuf, klen, seek_method))
-            if not lsm_csr_valid(pcursor):
-                raise KeyError(key)
-            _check(lsm_csr_value(pcursor, <const void **>(&vbuf), &vlen))
-            return vbuf[:vlen]
-        finally:
-            lsm_csr_close(pcursor)
+        with self._lock:
+            # Use low-level cursor APIs for performance, since this method
+            # could be a hot-spot.
+            with nogil:
+                rc = lsm_csr_open(self.db, &pcursor)
+            _check(rc)
+            try:
+                with nogil:
+                    rc = lsm_csr_seek(
+                        pcursor, <void *>kbuf, klen, seek_method)
+                _check(rc)
+                if not lsm_csr_valid(pcursor):
+                    raise KeyError(key)
+                with nogil:
+                    rc = lsm_csr_value(
+                        pcursor, <const void **>(&vbuf), &vlen)
+                _check(rc)
+                return vbuf[:vlen]
+            finally:
+                with nogil:
+                    lsm_csr_close(pcursor)
 
     cpdef fetch_bulk(self, keys, int seek_method=LSM_SEEK_EQ):
         """
@@ -794,24 +878,33 @@ cdef class LSM(object):
             char *kbuf
             char *vbuf
             dict accum = {}
+            int rc
             int vlen
             Py_ssize_t klen
 
-        _check(lsm_csr_open(self.db, &pcursor))
+        with self._lock:
+            with nogil:
+                rc = lsm_csr_open(self.db, &pcursor)
+            _check(rc)
 
-        try:
-            for key in keys:
-                bkey = encode(key)
-                PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
+            try:
+                for key in keys:
+                    bkey = encode(key)
+                    PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
 
-                _check(lsm_csr_seek(
-                    pcursor, <void *>kbuf, klen, seek_method))
-                if lsm_csr_valid(pcursor):
-                    _check(lsm_csr_value(
-                        pcursor, <const void **>(&vbuf), &vlen))
-                    accum[key] = vbuf[:vlen]
-        finally:
-            lsm_csr_close(pcursor)
+                    with nogil:
+                        rc = lsm_csr_seek(
+                            pcursor, <void *>kbuf, klen, seek_method)
+                    _check(rc)
+                    if lsm_csr_valid(pcursor):
+                        with nogil:
+                            rc = lsm_csr_value(
+                                pcursor, <const void **>(&vbuf), &vlen)
+                        _check(rc)
+                        accum[key] = vbuf[:vlen]
+            finally:
+                with nogil:
+                    lsm_csr_close(pcursor)
 
         return accum
 
@@ -996,10 +1089,14 @@ cdef class LSM(object):
         cdef:
             bytes bkey = encode(key)
             char *kbuf
+            int rc
             Py_ssize_t klen
 
         PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
-        _check(lsm_delete(self.db, kbuf, klen))
+        with self._lock:
+            with nogil:
+                rc = lsm_delete(self.db, kbuf, klen)
+            _check(rc)
 
     cpdef delete_range(self, start, end):
         """
@@ -1032,12 +1129,16 @@ cdef class LSM(object):
             bytes bend = encode(end)
             char *sb
             char *eb
+            int rc
             Py_ssize_t sblen, eblen
 
         PyBytes_AsStringAndSize(bstart, &sb, &sblen)
         PyBytes_AsStringAndSize(bend, &eb, &eblen)
 
-        _check(lsm_delete_range(self.db, sb, sblen, eb, eblen))
+        with self._lock:
+            with nogil:
+                rc = lsm_delete_range(self.db, sb, sblen, eb, eblen)
+            _check(rc)
 
     def __getitem__(self, key):
         """
@@ -1166,15 +1267,16 @@ cdef class LSM(object):
     cpdef int incr(self, key):
         cdef bytes value
         cdef int ivalue
-        try:
-            value = self[key]
-        except KeyError:
-            ivalue = 0
-        else:
-            ivalue = struct.unpack('>q', value)[0]
-        ivalue += 1
-        self[key] = struct.pack('>q', ivalue)
-        return ivalue
+        with self._lock:
+            try:
+                value = self[key]
+            except KeyError:
+                ivalue = 0
+            else:
+                ivalue = struct.unpack('>q', value)[0]
+            ivalue += 1
+            self[key] = struct.pack('>q', ivalue)
+            return ivalue
 
     cpdef flush(self):
         """
@@ -1198,7 +1300,11 @@ cdef class LSM(object):
         database. Checkpointing involves updating the database file header and
         (usually) syncing the contents of the database file to disk.
         """
-        _check(lsm_flush(self.db))
+        cdef int rc
+        with self._lock:
+            with nogil:
+                rc = lsm_flush(self.db)
+            _check(rc)
 
     cpdef int work(self, int nmerge=1, int nkb=4096) except -1:
         """
@@ -1224,7 +1330,9 @@ cdef class LSM(object):
         """
         cdef int nbytes_written
         cdef int rc
-        rc = lsm_work(self.db, nmerge, nkb, &nbytes_written)
+        with self._lock:
+            with nogil:
+                rc = lsm_work(self.db, nmerge, nkb, &nbytes_written)
         if rc == LSM_BUSY:
             raise RuntimeError('Unable to acquire the worker lock. Perhaps '
                                'another thread or process is working on the '
@@ -1245,7 +1353,11 @@ cdef class LSM(object):
         with older releases.
         """
         cdef int nkb = 0
-        _check(lsm_checkpoint(self.db, &nkb))
+        cdef int rc
+        with self._lock:
+            with nogil:
+                rc = lsm_checkpoint(self.db, &nkb)
+            _check(rc)
         return nkb
 
     cpdef begin(self):
@@ -1257,19 +1369,45 @@ cdef class LSM(object):
             In most cases it is preferable to use the :py:meth:`transaction`
             context manager/decorator.
         """
-        cdef int new_depth = self.transaction_depth + 1
-        _check(lsm_begin(self.db, new_depth))
+        cdef:
+            int new_depth
+            int rc
+            object owner = get_ident()
+
+        if (self.transaction_depth > 0 and
+                self._transaction_owner != owner):
+            raise RuntimeError('transaction is owned by another thread')
+
+        # Retain one recursive lock acquisition per open transaction level.
+        # This prevents calls on other threads from interleaving with a
+        # transaction between begin() and commit()/rollback().
+        self._lock.acquire()
+        new_depth = self.transaction_depth + 1
+        with nogil:
+            rc = lsm_begin(self.db, new_depth)
+        if rc != LSM_OK:
+            self._lock.release()
+            _check(rc)
+
+        if new_depth == 1:
+            self._transaction_owner = owner
         self.transaction_depth = new_depth
 
     cdef int _commit(self) except -1:
         cdef int new_depth
         cdef int rc
         if self.transaction_depth > 0:
+            if self._transaction_owner != get_ident():
+                raise RuntimeError('transaction is owned by another thread')
             new_depth = self.transaction_depth - 1
-            rc = lsm_commit(self.db, new_depth)
+            with nogil:
+                rc = lsm_commit(self.db, new_depth)
             # lsm_commit() closes the requested transaction level even if
             # finalizing the outer transaction reports an error.
             self.transaction_depth = new_depth
+            if new_depth == 0:
+                self._transaction_owner = None
+            self._lock.release()
             _check(rc)
             return 1
         return 0
@@ -1283,14 +1421,37 @@ cdef class LSM(object):
         return self._commit() and True or False
 
     cdef int _rollback(self, bint keep_transaction) except -1:
+        cdef int old_depth
         cdef int new_depth
         cdef int rc
         if self.transaction_depth > 0:
-            new_depth = self.transaction_depth
-            if not keep_transaction:
-                new_depth -= 1
-            rc = lsm_rollback(self.db, new_depth)
+            if self._transaction_owner != get_ident():
+                raise RuntimeError('transaction is owned by another thread')
+            old_depth = self.transaction_depth
+            new_depth = old_depth
+            if keep_transaction:
+                with nogil:
+                    rc = lsm_rollback(self.db, new_depth)
+            elif new_depth == 1:
+                with nogil:
+                    rc = lsm_rollback(self.db, 0)
+                if rc == LSM_OK:
+                    new_depth = 0
+            else:
+                # lsm_rollback(N) restores the Nth transaction but leaves it
+                # open. Close that now-empty nested level without rolling
+                # back its parent.
+                with nogil:
+                    rc = lsm_rollback(self.db, new_depth)
+                if rc == LSM_OK:
+                    new_depth -= 1
+                    with nogil:
+                        rc = lsm_commit(self.db, new_depth)
             self.transaction_depth = new_depth
+            if not keep_transaction and new_depth < old_depth:
+                if new_depth == 0:
+                    self._transaction_owner = None
+                self._lock.release()
             _check(rc)
             return 1
         return 0
@@ -1397,17 +1558,25 @@ cdef class Cursor(object):
         readonly bint _reverse
 
     def __cinit__(self, LSM lsm, bint reverse):
+        cdef int rc
         self.lsm = lsm
         self.cursor = <lsm_cursor *>0
         self.is_open = False
-        _check(lsm_csr_open(self.lsm.db, &self.cursor))
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_open(self.lsm.db, &self.cursor)
+            _check(rc)
         self.is_open = True
         self._consumed = False
         self._reverse = reverse
 
     def __dealloc__(self):
         if self.is_open:
-            lsm_csr_close(self.cursor)
+            self.lsm._lock.acquire()
+            try:
+                lsm_csr_close(self.cursor)
+            finally:
+                self.lsm._lock.release()
 
     cdef int _open(self) except -1:
         """
@@ -1415,12 +1584,16 @@ cdef class Cursor(object):
         by applications, as it is called automatically when a
         :py:class:`Cursor` is instantiated.
         """
-        if self.is_open:
-            return 0
+        cdef int rc
+        with self.lsm._lock:
+            if self.is_open:
+                return 0
 
-        _check(lsm_csr_open(self.lsm.db, &self.cursor))
-        self.is_open = True
-        return 1
+            with nogil:
+                rc = lsm_csr_open(self.lsm.db, &self.cursor)
+            _check(rc)
+            self.is_open = True
+            return 1
 
     def open(self):
         return self._open() and True or False
@@ -1439,13 +1612,17 @@ cdef class Cursor(object):
             If a cursor is not closed, then the database cannot be closed
             properly.
         """
-        if not self.is_open:
-            return 0
+        cdef int rc
+        with self.lsm._lock:
+            if not self.is_open:
+                return 0
 
-        _check(lsm_csr_close(self.cursor))
-        self.cursor = <lsm_cursor *>0
-        self.is_open = False
-        return 1
+            with nogil:
+                rc = lsm_csr_close(self.cursor)
+            _check(rc)
+            self.cursor = <lsm_cursor *>0
+            self.is_open = False
+            return 1
 
     def close(self):
         return self._close() and True or False
@@ -1474,20 +1651,21 @@ cdef class Cursor(object):
         return self
 
     def __next__(self):
-        if self._consumed:
-            raise StopIteration
+        with self.lsm._lock:
+            if self._consumed:
+                raise StopIteration
 
-        key = self._key()
-        value = self._value()
-        try:
-            if self._reverse:
-                self.previous()
-            else:
-                self.next()
-        except StopIteration:
-            self._consumed = True
+            key = self._key()
+            value = self._value()
+            try:
+                if self._reverse:
+                    self.previous()
+                else:
+                    self.next()
+            except StopIteration:
+                self._consumed = True
 
-        return (key, value)
+            return (key, value)
 
     cpdef int compare(self, key, int nlen=0):
         """
@@ -1503,12 +1681,14 @@ cdef class Cursor(object):
 
         if nlen == 0:
             nlen = klen
-        rc = lsm_csr_cmp(
-            self.cursor,
-            kbuf,
-            nlen,
-            &res)
-        _check(rc)
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_cmp(
+                    self.cursor,
+                    kbuf,
+                    nlen,
+                    &res)
+            _check(rc)
         return res
 
     cpdef seek(self, key, int method=LSM_SEEK_EQ):
@@ -1530,32 +1710,45 @@ cdef class Cursor(object):
         cdef:
             bytes bkey = encode(key)
             char *kbuf
+            int rc
             Py_ssize_t klen
 
         PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
 
-        _check(lsm_csr_seek(
-            self.cursor,
-            <void *>kbuf,  # For some reason a void ptr?
-            klen,
-            method))
-        if not self.is_valid():
-            raise KeyError(key)
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_seek(
+                    self.cursor,
+                    <void *>kbuf,
+                    klen,
+                    method)
+            _check(rc)
+            if not lsm_csr_valid(self.cursor):
+                raise KeyError(key)
 
     cpdef bint is_valid(self):
         """
         Return a boolean indicating whether the cursor is pointing at a
         valid record.
         """
-        return lsm_csr_valid(self.cursor) != 0
+        with self.lsm._lock:
+            return lsm_csr_valid(self.cursor) != 0
 
     cpdef first(self):
         """Jump to the first key in the database."""
-        _check(lsm_csr_first(self.cursor))
+        cdef int rc
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_first(self.cursor)
+            _check(rc)
 
     cpdef last(self):
         """Jump to the last key in the database."""
-        _check(lsm_csr_last(self.cursor))
+        cdef int rc
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_last(self.cursor)
+            _check(rc)
 
     cpdef next(self):
         """
@@ -1567,10 +1760,13 @@ cdef class Cursor(object):
         :py:meth:`first` or :py:meth:`seek` with a seek method of ``SEEK_GE``.
         """
         cdef int rc
-        _check(lsm_csr_next(self.cursor))
-        rc = lsm_csr_valid(self.cursor)
-        if not rc:
-            raise StopIteration
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_next(self.cursor)
+            _check(rc)
+            rc = lsm_csr_valid(self.cursor)
+            if not rc:
+                raise StopIteration
 
     cpdef previous(self):
         """
@@ -1582,10 +1778,13 @@ cdef class Cursor(object):
         :py:meth:`last` or :py:meth:`seek` with a seek method of ``SEEK_LE``.
         """
         cdef int rc
-        _check(lsm_csr_prev(self.cursor))
-        rc = lsm_csr_valid(self.cursor)
-        if not rc:
-            raise StopIteration
+        with self.lsm._lock:
+            with nogil:
+                rc = lsm_csr_prev(self.cursor)
+            _check(rc)
+            rc = lsm_csr_valid(self.cursor)
+            if not rc:
+                raise StopIteration
 
     def fetch_until(self, key):
         """
@@ -1657,22 +1856,32 @@ cdef class Cursor(object):
         cdef:
             char *k
             int klen
+            int rc
 
-        if not self.is_valid():
-            _check(LSM_MISUSE)
-        _check(lsm_csr_key(self.cursor, <const void **>(&k), &klen))
-        return k[:klen]
+        with self.lsm._lock:
+            if not lsm_csr_valid(self.cursor):
+                _check(LSM_MISUSE)
+            with nogil:
+                rc = lsm_csr_key(
+                    self.cursor, <const void **>(&k), &klen)
+            _check(rc)
+            return k[:klen]
 
     cdef inline _value(self):
         """Return the value at the cursor's current position."""
         cdef:
             char *v
             int vlen
+            int rc
 
-        if not self.is_valid():
-            _check(LSM_MISUSE)
-        _check(lsm_csr_value(self.cursor, <const void **>(&v), &vlen))
-        return v[:vlen]
+        with self.lsm._lock:
+            if not lsm_csr_valid(self.cursor):
+                _check(LSM_MISUSE)
+            with nogil:
+                rc = lsm_csr_value(
+                    self.cursor, <const void **>(&v), &vlen)
+            _check(rc)
+            return v[:vlen]
 
     def key(self):
         return self._key()
@@ -1762,10 +1971,13 @@ cdef class Transaction(object):
         transactional behavior for the rest of the block.
         """
         cdef int rc
-        rc = self.lsm._commit()
-        if begin:
-            self.lsm.begin()
-        return rc
+        # Keep an extra recursive acquisition across commit-and-restart so
+        # another thread cannot enter the connection in between.
+        with self.lsm._lock:
+            rc = self.lsm._commit()
+            if begin:
+                self.lsm.begin()
+            return rc
 
     def rollback(self, begin=True):
         """

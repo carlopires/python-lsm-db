@@ -72,6 +72,38 @@ class TestLSM(BaseTestLSM):
         self.assertBEqual(self.db['foo'], 'bar')
         self.assertBEqual(self.db['nug'], 'nizer')
 
+    def test_insert_many(self):
+        rows = ((('k%s' % i), ('v%s' % i)) for i in range(4))
+        self.assertEqual(self.db.insert_many(rows), 4)
+        self.assertBEqual(list(self.db), [
+            ('k0', 'v0'),
+            ('k1', 'v1'),
+            ('k2', 'v2'),
+            ('k3', 'v3'),
+        ])
+
+        self.assertEqual(
+            self.db.insert_many({'k1': 'replaced', 'k4': 'v4'}), 2)
+        self.assertBEqual(self.db['k1'], 'replaced')
+        self.assertBEqual(self.db['k4'], 'v4')
+        self.assertEqual(self.db.insert_many([]), 0)
+
+    def test_insert_many_is_atomic(self):
+        def invalid_rows():
+            yield ('first', 'value')
+            yield ('invalid', None)
+
+        self.assertRaises(TypeError, self.db.insert_many, invalid_rows())
+        self.assertMissing('first')
+        self.assertMissing('invalid')
+        self.assertEqual(self.db.transaction_depth, 0)
+
+    def test_update_is_atomic(self):
+        values = {'first': 'value', 'invalid': None}
+        self.assertRaises(TypeError, self.db.update, values)
+        self.assertMissing('first')
+        self.assertEqual(self.db.transaction_depth, 0)
+
     def test_keys_values(self):
         for i in range(1, 5):
             self.db['k%s' % i] = 'v%s' % i
@@ -489,6 +521,66 @@ class TestTransactions(BaseTestLSM):
             self.assertEqual(readonly_db.transaction_depth, 0)
         finally:
             readonly_db.close()
+
+    def test_insert_many_nested_rollback(self):
+        def invalid_rows():
+            yield ('batch-1', 'value')
+            yield ('batch-2', None)
+
+        with self.db.transaction():
+            self.db['outer'] = 'value'
+            self.assertRaises(
+                TypeError, self.db.insert_many, invalid_rows())
+            self.assertDepth(1)
+            self.assertMissing('batch-1')
+            self.assertBEqual(self.db['outer'], 'value')
+
+        self.assertBEqual(self.db['outer'], 'value')
+
+    def test_transaction_serializes_other_threads(self):
+        started = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        def insert_from_thread():
+            started.set()
+            try:
+                self.db['thread'] = 'value'
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        with self.db.transaction():
+            self.db['owner'] = 'value'
+            thread = threading.Thread(target=insert_from_thread)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.05))
+
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertBEqual(self.db['owner'], 'value')
+        self.assertBEqual(self.db['thread'], 'value')
+
+    def test_transaction_rejects_foreign_commit(self):
+        errors = []
+
+        def commit_from_thread():
+            try:
+                self.db.commit()
+            except Exception as exc:
+                errors.append(exc)
+
+        with self.db.transaction():
+            thread = threading.Thread(target=commit_from_thread)
+            thread.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], RuntimeError)
+            self.assertDepth(1)
 
 
 class TestCursors(BaseTestLSM):

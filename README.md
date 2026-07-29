@@ -78,14 +78,22 @@ assert db["k1xx", SEEK_LE] == b"1"
 assert db["k1xx", SEEK_GE] == b"2"
 ```
 
-`update()` inserts a dictionary of records:
+`insert_many()` atomically inserts either a mapping or an iterable of
+`(key, value)` pairs in a single transaction:
+
+```python
+rows = ((f"key-{i}", f"value-{i}") for i in range(10_000))
+inserted = db.insert_many(rows)
+assert inserted == 10_000
+```
+
+The input is streamed rather than materialized. If conversion or insertion
+fails, the complete batch is rolled back. `update()` provides the same atomic
+behavior for mappings:
 
 ```python
 db.update({"alpha": "a", "beta": "b"})
 ```
-
-Each insertion is its own transaction unless `update()` is wrapped in an
-explicit transaction.
 
 ### Slices and iteration
 
@@ -168,6 +176,16 @@ def store_pair(key1, value1, key2, value2):
 
 Explicit `begin()`, `commit()`, and `rollback()` methods are available when a
 context manager is not suitable.
+
+### Threads
+
+Potentially blocking database, cursor, and maintenance operations release the
+GIL. Each connection serializes access with a re-entrant lock. A transaction
+owns its connection until its outermost commit or rollback, so another thread
+cannot interleave work with it.
+
+Use one `LSM` connection per worker thread when actual overlap is desired.
+LSM1 permits concurrent readers but still has a single-writer model.
 
 ### Maintenance and tuning
 

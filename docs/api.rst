@@ -27,6 +27,7 @@ API Documentation
       tree_size,
       __enter__,
       insert,
+      insert_many,
       update,
       fetch,
       fetch_bulk,
