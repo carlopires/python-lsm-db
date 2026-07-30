@@ -5,6 +5,7 @@ include lsm.pyx
 include overview.md
 include pyproject.toml
 include tests.py
+recursive-include benchmarks *.py
 recursive-include docs *
 recursive-include src *
 
