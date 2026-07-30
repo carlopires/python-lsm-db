@@ -1809,6 +1809,152 @@ static int treeDeleteEntry(lsm_db *db, TreeCursor *pCsr, u32 iNewptr){
 }
 
 /*
+** Return the minimum and maximum number of keys that may appear in a
+** balanced tree of height nHeight. All non-leaf nodes built below have
+** between 2 and 4 children.
+*/
+static void treeRangeBuildLimits(int nHeight, int *pnMin, int *pnMax){
+  int i;
+  int nMin = 1;
+  int nMax = 3;
+  for(i=1; i<nHeight; i++){
+    nMin = (nMin>0x3fffffff ? 0x7fffffff : 1 + 2*nMin);
+    nMax = (nMax>0x1fffffff ? 0x7fffffff : 3 + 4*nMax);
+  }
+  *pnMin = nMin;
+  *pnMax = nMax;
+}
+
+/*
+** Build a balanced tree containing the nKey key pointers in aKey. No
+** TreeKey objects are copied - only a new, compact node hierarchy is
+** allocated. This is safe for MVCC because the old hierarchy and key
+** objects remain immutable and reachable by older snapshots.
+*/
+static u32 treeRangeBuild(
+  lsm_db *db,
+  const u32 *aKey,
+  int nKey,
+  int nHeight,
+  int bRoot,
+  int *pRc
+){
+  u32 iNode = 0;
+  TreeNode *pNode;
+
+  if( *pRc!=LSM_OK || nKey<=0 ) return 0;
+  pNode = (nHeight==1 && bRoot==0)
+      ? (TreeNode *)newTreeLeaf(db, &iNode, pRc)
+      : newTreeNode(db, &iNode, pRc);
+  if( pNode==0 ) return 0;
+
+  if( nHeight==1 ){
+    int i;
+    int iBase = (nKey==1 ? 1 : 0);
+    assert( nKey>=1 && nKey<=3 );
+    for(i=0; i<nKey; i++) pNode->aiKeyPtr[iBase+i] = aKey[i];
+  }else{
+    int nMin;
+    int nMax;
+    int nCell;
+    int i;
+    int iKey = 0;
+    int iBase;
+    int nForChildren;
+
+    treeRangeBuildLimits(nHeight-1, &nMin, &nMax);
+    for(nCell=1; nCell<=3; nCell++){
+      int nChild = nCell + 1;
+      int nRemain = nKey - nCell;
+      if( nRemain>=nChild*nMin && nRemain<=nChild*nMax ) break;
+    }
+    assert( nCell<=3 );
+    iBase = (nCell==1 ? 1 : 0);
+    nForChildren = nKey - nCell;
+
+    for(i=0; i<=nCell; i++){
+      int nLeft = nCell + 1 - i;
+      int nSub = nForChildren / nLeft;
+      if( nSub<nMin ) nSub = nMin;
+      if( nSub>nMax ) nSub = nMax;
+
+      pNode->aiChildPtr[iBase+i] = treeRangeBuild(
+          db, &aKey[iKey], nSub, nHeight-1, 0, pRc
+      );
+      iKey += nSub;
+      nForChildren -= nSub;
+      if( i<nCell ) pNode->aiKeyPtr[iBase+i] = aKey[iKey++];
+    }
+    assert( iKey==nKey );
+  }
+
+  return iNode;
+}
+
+/*
+** Rebuild the live tree without keys strictly between the supplied bounds.
+** This converts a wide range deletion from repeated O(log N) mutations into
+** one O(N) scan and a linear node build.
+*/
+static int treeDeleteRangeRebuild(
+  lsm_db *db,
+  void *pKey1, int nKey1,
+  void *pKey2, int nKey2
+){
+  int rc = LSM_OK;
+  int nKeep = 0;
+  int nHeight = 1;
+  int nMax = 3;
+  LsmString keys;
+  TreeCursor csr;
+
+  lsmStringInit(&keys, db->pEnv);
+  treeCursorInit(db, 0, &csr);
+  for(rc=lsmTreeCursorEnd(&csr, 0);
+      rc==LSM_OK && lsmTreeCursorValid(&csr);
+      rc=lsmTreeCursorNext(&csr)
+  ){
+    TreeKey *pKey = csrGetKey(&csr, &csr.blob, &rc);
+    if( pKey ){
+      int bKeep = (
+          treeKeycmp(TKV_KEY(pKey), pKey->nKey, pKey1, nKey1)<=0
+       || treeKeycmp(TKV_KEY(pKey), pKey->nKey, pKey2, nKey2)>=0
+      );
+      if( bKeep ){
+        TreeNode *pNode = csr.apTreeNode[csr.iNode];
+        u32 iPtr = pNode->aiKeyPtr[csr.aiCell[csr.iNode]];
+        rc = lsmStringBinAppend(&keys, (u8 *)&iPtr, sizeof(iPtr));
+        if( rc==LSM_OK ) nKeep++;
+      }
+    }
+  }
+  tblobFree(db, &csr.blob);
+
+  while( nKeep>nMax ){
+    nHeight++;
+    nMax = (nMax>0x1fffffff ? 0x7fffffff : 3 + 4*nMax);
+  }
+
+  if( rc==LSM_OK ){
+    if( nKeep==0 ){
+      db->treehdr.root.iRoot = 0;
+      db->treehdr.root.nHeight = 0;
+    }else{
+      u32 iRoot = treeRangeBuild(
+          db, (const u32 *)keys.z, nKeep, nHeight, 1, &rc
+      );
+      if( rc==LSM_OK ){
+        db->treehdr.root.iRoot = iRoot;
+        db->treehdr.root.nHeight = nHeight;
+      }
+    }
+  }
+
+  lsmStringClear(&keys);
+  return rc;
+}
+
+/*
 ** Delete a range of keys from the tree structure (i.e. the lsm_delete_range()
 ** function, not lsm_delete()).
 **
@@ -1833,6 +1979,7 @@ int lsmTreeDelete(
 ){
   int rc = LSM_OK;
   int bDone = 0;
+  int bRebuilt = 0;
   TreeRoot *p = &db->treehdr.root;
   TreeBlob blob = {0, 0};
 
@@ -1848,9 +1995,42 @@ int lsmTreeDelete(
   dump_tree_contents(db, "before delete");
 #endif
 
+  /*
+  ** Detect wide ranges with a bounded scan. For 256 or more live-tree keys,
+  ** rebuilding the compact survivor hierarchy avoids hundreds of repeated
+  ** root-to-leaf copy-on-write mutations. Small ranges retain the lower
+  ** latency pointwise path below.
+  */
+  if( p->iRoot ){
+    int res = 0;
+    int nRange = 0;
+    TreeCursor count;
+    treeCursorInit(db, 0, &count);
+    rc = lsmTreeCursorSeek(&count, pKey1, nKey1, &res);
+    if( res<=0 && lsmTreeCursorValid(&count) ) lsmTreeCursorNext(&count);
+    while( rc==LSM_OK && lsmTreeCursorValid(&count) && nRange<256 ){
+      void *pCountKey;
+      int nCountKey;
+      rc = lsmTreeCursorKey(&count, 0, &pCountKey, &nCountKey);
+      if( rc==LSM_OK
+       && treeKeycmp(pCountKey, nCountKey, pKey2, nKey2)<0
+      ){
+        nRange++;
+        rc = lsmTreeCursorNext(&count);
+      }else{
+        break;
+      }
+    }
+    tblobFree(db, &count.blob);
+    if( rc==LSM_OK && nRange==256 ){
+      rc = treeDeleteRangeRebuild(db, pKey1, nKey1, pKey2, nKey2);
+      bRebuilt = (rc==LSM_OK);
+    }
+  }
+
   /* Step 1. This loop runs until the tree contains no keys within the
   ** range being deleted. Or until an error occurs. */
-  while( bDone==0 && rc==LSM_OK ){
+  while( bRebuilt==0 && bDone==0 && rc==LSM_OK ){
     int res;
     TreeCursor csr;               /* Cursor to seek to first key in range */
     void *pDel; int nDel;         /* Key to (possibly) delete this iteration */

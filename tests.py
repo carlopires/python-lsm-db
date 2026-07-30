@@ -462,6 +462,26 @@ class TestLSM(BaseTestLSM):
             ('k8', 'v8'),
         ])
 
+    def test_large_delete_range(self):
+        rows = [('k%04d' % i, 'v%04d' % i) for i in range(700)]
+        self.db.upsert_many(rows, sorted=True)
+
+        self.db.delete_range('k0100', 'k0600')
+        expected = rows[:101] + rows[600:]
+        self.assertBEqual(list(self.db), expected)
+
+        self.db['k0350'] = 'restored'
+        self.assertBEqual(self.db['k0350'], 'restored')
+
+    def test_large_delete_range_rollback(self):
+        rows = [('k%04d' % i, 'v%04d' % i) for i in range(700)]
+        self.db.upsert_many(rows, sorted=True)
+
+        self.db.begin()
+        self.db.delete_range('k0100', 'k0600')
+        self.db.rollback(False)
+        self.assertBEqual(list(self.db), rows)
+
     def test_iter_database(self):
         for i in range(1, 5):
             self.db['k%s' % i] = 'v%s' % i
