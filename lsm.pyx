@@ -124,6 +124,11 @@ cdef extern from "src/lsm.h" nogil:
         int nOp,
         unsigned int flags,
         int *piFailed)
+    cdef int lsm_ingest_sorted(
+        lsm_db *pDb,
+        const lsm_batch_op *aOp,
+        int nOp,
+        int *piFailed)
 
     cdef int lsm_work(lsm_db *pDb, int nMerge, int nKB, int *pnWrite)
     cdef int lsm_flush(lsm_db *pDb)
@@ -390,6 +395,7 @@ cdef class LSM(object):
         dict _options
         object _lock
         object _transaction_owner
+        int _cursor_count
         readonly bint is_open
         readonly int transaction_depth
         readonly filename
@@ -398,6 +404,7 @@ cdef class LSM(object):
         self.db = <lsm_db *>0
         self._lock = RLock()
         self._transaction_owner = None
+        self._cursor_count = 0
         self.is_open = False
         self.transaction_depth = 0
         self.was_opened = False
@@ -731,7 +738,8 @@ cdef class LSM(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    cdef _native_write_batch(self, list batch, bint sorted_input=False):
+    cdef _native_write_batch(
+            self, list batch, bint sorted_input=False, bint ingest=False):
         """Apply a list of encoded native batch descriptors."""
         cdef:
             Py_ssize_t i
@@ -777,12 +785,16 @@ cdef class LSM(object):
                     ops[i].nVal = <int>vlen
 
             with nogil:
-                rc = lsm_write_batch_ex(
-                    self.db,
-                    ops,
-                    <int>n,
-                    LSM_BATCH_SORTED if sorted_input else 0,
-                    &failed)
+                if ingest:
+                    rc = lsm_ingest_sorted(
+                        self.db, ops, <int>n, &failed)
+                else:
+                    rc = lsm_write_batch_ex(
+                        self.db,
+                        ops,
+                        <int>n,
+                        LSM_BATCH_SORTED if sorted_input else 0,
+                        &failed)
         finally:
             free(ops)
 
@@ -870,6 +882,45 @@ cdef class LSM(object):
             self._commit()
 
         return count
+
+    def ingest_sorted(self, rows):
+        """
+        Atomically ingest sorted ``(key, value)`` pairs as an immutable run.
+
+        Unlike :py:meth:`upsert_many`, this direct-to-disk path materializes
+        its input before entering native code. Keys must be strictly
+        increasing. Open transactions and cursors are not permitted.
+
+        :returns: Number of rows ingested.
+        """
+        cdef:
+            bytes bkey
+            bytes bvalue
+            bytes previous = None
+            list batch = []
+
+        if hasattr(rows, 'items'):
+            rows = rows.items()
+
+        with self._lock:
+            if self.transaction_depth:
+                raise RuntimeError(
+                    'sorted ingestion is not allowed in a transaction')
+            if self._cursor_count:
+                raise RuntimeError(
+                    'sorted ingestion requires all cursors to be closed')
+
+            for key, value in rows:
+                bkey = encode(key)
+                bvalue = encode(value)
+                if previous is not None and bkey <= previous:
+                    raise ValueError(
+                        'ingest keys must be strictly increasing')
+                previous = bkey
+                batch.append((LSM_BATCH_PUT, bkey, bvalue))
+
+            self._native_write_batch(batch, True, True)
+            return len(batch)
 
     def insert_many(self, rows, int batch_size=4096, bint sorted=False):
         """Compatibility alias for :py:meth:`upsert_many`."""
@@ -1923,6 +1974,7 @@ cdef class Cursor(object):
             with nogil:
                 rc = lsm_csr_open(self.lsm.db, &self.cursor)
             _check(rc)
+            self.lsm._cursor_count += 1
         self.is_open = True
         self._consumed = False
         self._reverse = reverse
@@ -1932,6 +1984,7 @@ cdef class Cursor(object):
             self.lsm._lock.acquire()
             try:
                 lsm_csr_close(self.cursor)
+                self.lsm._cursor_count -= 1
             finally:
                 self.lsm._lock.release()
 
@@ -1950,6 +2003,7 @@ cdef class Cursor(object):
                 rc = lsm_csr_open(self.lsm.db, &self.cursor)
             _check(rc)
             self.is_open = True
+            self.lsm._cursor_count += 1
             return 1
 
     def open(self):
@@ -1979,6 +2033,7 @@ cdef class Cursor(object):
             _check(rc)
             self.cursor = <lsm_cursor *>0
             self.is_open = False
+            self.lsm._cursor_count -= 1
             return 1
 
     def close(self):

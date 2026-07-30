@@ -577,6 +577,19 @@ int lsm_write_batch_ex(
 );
 
 /*
+** Materialize a strictly increasing sequence of puts and point deletes as
+** one immutable top-level sorted run. The run is published atomically and
+** checkpointed before this function returns. Existing transactions and open
+** cursors are not permitted.
+*/
+int lsm_ingest_sorted(
+    lsm_db *,
+    const lsm_batch_op *aOp,
+    int nOp,
+    int *piFailed
+);
+
+/*
 ** CAPI: Explicit Database Work and Checkpointing
 **
 ** This function is called by a thread to work on the database structure.

@@ -810,6 +810,9 @@ int lsmSortedWalkFreelist(lsm_db *, int, int (*)(void *, int, i64), void *);
 int lsmSaveWorker(lsm_db *, int);
 
 int lsmFlushTreeToDisk(lsm_db *pDb);
+int lsmSortedIngest(
+    lsm_db *pDb, const lsm_batch_op *aOp, int nOp, int *piFailed
+);
 
 void lsmSortedRemap(lsm_db *pDb);
 

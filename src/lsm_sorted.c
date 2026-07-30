@@ -106,6 +106,9 @@
 typedef struct SegmentPtr SegmentPtr;
 typedef struct LsmBlob LsmBlob;
 
+static int sortedDbIsFull(lsm_db *);
+static int sortedWork(lsm_db *, int, int, int, int *);
+
 struct LsmBlob {
   lsm_env *pEnv;
   void *pData;
@@ -4450,6 +4453,105 @@ static int sortedNewToplevel(
   pDb->pFreelist = 0;
   pDb->bUseFreelist = 0;
   lsmFree(pDb->pEnv, freelist.aEntry);
+  return rc;
+}
+
+/*
+** Write a validated, strictly ordered array of point operations directly
+** into a new immutable top-level run. The caller owns the writer lock and
+** has ensured that the live trees are empty, so publishing the worker
+** snapshot makes the complete run visible atomically.
+*/
+static int sortedIngestToplevel(
+  lsm_db *pDb,
+  const lsm_batch_op *aOp,
+  int nOp,
+  int *piFailed
+){
+  int rc = LSM_OK;
+  int i;
+  int nWrite = 0;
+  LsmPgno iLeftPtr = 0;
+  MultiCursor *pCsr = 0;
+  Level *pNext = lsmDbSnapshotLevel(pDb->pWorker);
+  Level *pNew = 0;
+  Merge merge;
+  MergeWorker mergeworker;
+
+  memset(&merge, 0, sizeof(merge));
+  memset(&mergeworker, 0, sizeof(mergeworker));
+
+  pNew = (Level *)lsmMallocZeroRc(pDb->pEnv, sizeof(Level), &rc);
+  if( pNew ){
+    pNew->pNext = pNext;
+    pNew->pMerge = &merge;
+    pNew->flags |= LEVEL_INCOMPLETE;
+    lsmDbSnapshotSetLevel(pDb->pWorker, pNew);
+  }
+
+  pCsr = multiCursorNew(pDb, &rc);
+  if( pCsr ){
+    pCsr->pPrevMergePtr = &iLeftPtr;
+    mergeworker.pDb = pDb;
+    mergeworker.pLevel = pNew;
+    mergeworker.pCsr = pCsr;
+    mergeworker.bFlush = 1;
+  }
+
+  for(i=0; rc==LSM_OK && i<nOp; i++){
+    const lsm_batch_op *p = &aOp[i];
+    int eType = (
+        p->eType==LSM_BATCH_PUT ? LSM_INSERT : LSM_POINT_DELETE
+    );
+    void *pVal = (p->eType==LSM_BATCH_PUT ? (void *)p->pVal : 0);
+    int nVal = (p->eType==LSM_BATCH_PUT ? p->nVal : -1);
+    rc = mergeWorkerWrite(
+        &mergeworker, eType, (void *)p->pKey, p->nKey, pVal, nVal, 0
+    );
+    if( rc!=LSM_OK && piFailed ) *piFailed = i;
+  }
+
+  if( pCsr ){
+    mergeWorkerShutdown(&mergeworker, &rc);
+    nWrite = mergeworker.nWork;
+  }
+  if( rc==LSM_OK && pNew && pNew->lhs.iFirst ){
+    rc = lsmFsSortedFinish(pDb->pFS, &pNew->lhs);
+  }
+
+  if( pNew ){
+    pNew->flags &= ~LEVEL_INCOMPLETE;
+    pNew->pMerge = 0;
+  }
+  if( rc!=LSM_OK || pNew==0 || pNew->lhs.iFirst==0 ){
+    lsmDbSnapshotSetLevel(pDb->pWorker, pNext);
+    sortedFreeLevel(pDb->pEnv, pNew);
+  }else{
+    assertBtreeOk(pDb, &pNew->lhs);
+    assertRunInOrder(pDb, &pNew->lhs);
+    sortedInvokeWorkHook(pDb);
+  }
+
+  pDb->pWorker->nWrite += nWrite;
+  return rc;
+}
+
+int lsmSortedIngest(
+  lsm_db *pDb,
+  const lsm_batch_op *aOp,
+  int nOp,
+  int *piFailed
+){
+  int rc;
+
+  rc = lsmBeginWork(pDb);
+  while( rc==LSM_OK && sortedDbIsFull(pDb) ){
+    rc = sortedWork(pDb, 256, pDb->nMerge, 1, 0);
+  }
+  if( rc==LSM_OK ){
+    rc = sortedIngestToplevel(pDb, aOp, nOp, piFailed);
+  }
+  lsmFinishWork(pDb, 0, &rc);
   return rc;
 }
 

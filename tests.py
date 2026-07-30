@@ -110,6 +110,46 @@ class TestLSM(BaseTestLSM):
             self.db.upsert_many(rows, batch_size=2, sorted=True)
         self.assertBEqual(list(self.db), [('keep', 'value')])
 
+    def test_ingest_sorted(self):
+        self.db.upsert_many([('b', 'old'), ('x', 'keep')], sorted=True)
+        rows = [('a', '1'), ('b', 'new'), ('c', '3'), ('z', 'last')]
+        self.assertEqual(self.db.ingest_sorted(rows), 4)
+        self.assertBEqual(list(self.db), [
+            ('a', '1'),
+            ('b', 'new'),
+            ('c', '3'),
+            ('x', 'keep'),
+            ('z', 'last'),
+        ])
+
+        self.db.close()
+        self.db = lsm.LSM(self.filename)
+        self.assertBEqual(self.db['b'], 'new')
+        self.assertBEqual(self.db['z'], 'last')
+
+    def test_ingest_sorted_large_run(self):
+        rows = [
+            ('k%05d' % i, ('value-%05d-' % i) + ('x' * 80))
+            for i in range(3000)
+        ]
+        self.assertEqual(self.db.ingest_sorted(rows), len(rows))
+        self.assertBEqual(list(self.db), rows)
+
+    def test_ingest_sorted_validates_before_writing(self):
+        self.db['keep'] = 'value'
+        with self.assertRaises(ValueError):
+            self.db.ingest_sorted([('b', '2'), ('a', '1')])
+        self.assertBEqual(list(self.db), [('keep', 'value')])
+
+        self.db.begin()
+        with self.assertRaises(RuntimeError):
+            self.db.ingest_sorted([('a', '1')])
+        self.db.rollback(False)
+
+        with self.db.cursor():
+            with self.assertRaises(RuntimeError):
+                self.db.ingest_sorted([('a', '1')])
+
     def test_delete_many(self):
         self.db.upsert_many((('k%s' % i, 'v%s' % i) for i in range(5)))
         self.assertEqual(

@@ -903,6 +903,87 @@ int lsm_write_batch(
 }
 
 /*
+** Create and atomically publish an immutable run from sorted point
+** operations. Flushing before taking the writer lock ensures that the live
+** tree does not incorrectly shadow the newer ingested run. The empty-tree
+** check after locking closes the race with another writer.
+*/
+int lsm_ingest_sorted(
+  lsm_db *db,
+  const lsm_batch_op *aOp,
+  int nOp,
+  int *piFailed
+){
+  int rc = LSM_OK;
+  int i;
+  int bWriter = 0;
+
+  if( piFailed ) *piFailed = -1;
+  if( nOp<0 || (nOp>0 && aOp==0) ) return LSM_MISUSE;
+  if( nOp==0 ) return LSM_OK;
+  if( db->nTransOpen || db->pCsr ) return LSM_MISUSE;
+
+  for(i=0; i<nOp; i++){
+    const lsm_batch_op *p = &aOp[i];
+    if( p->nKey<0 || (p->nKey>0 && p->pKey==0) ){
+      rc = LSM_MISUSE;
+    }else if( p->eType==LSM_BATCH_PUT ){
+      if( p->nVal<0 || (p->nVal>0 && p->pVal==0) ) rc = LSM_MISUSE;
+    }else if( p->eType!=LSM_BATCH_DELETE ){
+      rc = LSM_MISUSE;
+    }
+    if( rc==LSM_OK && i>0 ){
+      const lsm_batch_op *pPrev = &aOp[i-1];
+      if( db->xCmp(
+            (void *)pPrev->pKey, pPrev->nKey, (void *)p->pKey, p->nKey
+          )>=0 ){
+        rc = LSM_MISMATCH;
+      }
+    }
+    if( rc!=LSM_OK ){
+      if( piFailed ) *piFailed = i;
+      return rc;
+    }
+  }
+
+  /*
+  ** Usually the first iteration succeeds. Retry if a different writer
+  ** installs live-tree data in the short interval between flush and lock.
+  */
+  for(i=0; rc==LSM_OK && i<8; i++){
+    rc = lsm_flush(db);
+    if( rc==LSM_OK ){
+      rc = lsmBeginWriteTrans(db);
+      bWriter = (rc==LSM_OK);
+    }
+    if( rc!=LSM_OK
+     || (lsmTreeSize(db)==0 && lsmTreeHasOld(db)==0)
+    ){
+      break;
+    }
+    lsmFinishWriteTrans(db, 0);
+    lsmFinishReadTrans(db);
+    bWriter = 0;
+  }
+  if( rc==LSM_OK && bWriter==0 ) rc = LSM_BUSY;
+
+  if( rc==LSM_OK ){
+    rc = lsmSortedIngest(db, aOp, nOp, piFailed);
+  }
+  if( rc==LSM_OK ){
+    rc = lsm_checkpoint(db, 0);
+  }
+
+  if( bWriter ){
+    int rc2 = lsmFinishWriteTrans(db, rc==LSM_OK);
+    if( rc==LSM_OK ) rc = rc2;
+    lsmFinishReadTrans(db);
+  }
+
+  return rc;
+}
+
+/*
 ** Open a new cursor handle. 
 **
 ** If there are currently no other open cursor handles, and no open write
