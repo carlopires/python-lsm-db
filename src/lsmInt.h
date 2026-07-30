@@ -640,6 +640,9 @@ int lsmTreeLoadHeader(lsm_db *pDb, int *);
 int lsmTreeLoadHeaderOk(lsm_db *, int);
 
 int lsmTreeInsert(lsm_db *pDb, void *pKey, int nKey, void *pVal, int nVal);
+int lsmTreeInsertAppend(
+    lsm_db *pDb, void *pKey, int nKey, void *pVal, int nVal
+);
 int lsmTreeDelete(lsm_db *db, void *pKey1, int nKey1, void *pKey2, int nKey2);
 void lsmTreeRollback(lsm_db *pDb, TreeMark *pMark);
 void lsmTreeMark(lsm_db *pDb, TreeMark *pMark);

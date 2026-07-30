@@ -96,6 +96,20 @@ class TestLSM(BaseTestLSM):
         self.assertBEqual(self.db['created'], 'value')
         self.assertRaises(ValueError, self.db.upsert_many, [], 0)
 
+    def test_sorted_upsert_many(self):
+        self.db['m'] = 'old'
+        rows = [('a', '1'), ('m', 'new'), ('z', '3'), ('zz', '4')]
+        self.assertEqual(
+            self.db.upsert_many(rows, batch_size=2, sorted=True), 4)
+        self.assertBEqual(list(self.db), rows)
+
+    def test_sorted_upsert_many_validates_across_chunks(self):
+        self.db['keep'] = 'value'
+        rows = [('a', '1'), ('c', '3'), ('b', '2')]
+        with self.assertRaises(ValueError):
+            self.db.upsert_many(rows, batch_size=2, sorted=True)
+        self.assertBEqual(list(self.db), [('keep', 'value')])
+
     def test_delete_many(self):
         self.db.upsert_many((('k%s' % i, 'v%s' % i) for i in range(5)))
         self.assertEqual(
@@ -118,6 +132,14 @@ class TestLSM(BaseTestLSM):
         self.assertBEqual(self.db['keep-1'], '1')
         self.assertBEqual(self.db['keep-2'], '2')
         self.assertEqual(self.db.transaction_depth, 0)
+
+    def test_sorted_delete_many(self):
+        self.db.upsert_many(
+            (('k%d' % i, 'v%d' % i) for i in range(6)), sorted=True)
+        self.assertEqual(
+            self.db.delete_many(['k1', 'k3', 'k5'], sorted=True), 3)
+        self.assertBEqual(
+            list(self.db), [('k0', 'v0'), ('k2', 'v2'), ('k4', 'v4')])
 
     def test_apply_batch(self):
         operations = [
@@ -152,6 +174,23 @@ class TestLSM(BaseTestLSM):
         self.assertFalse(batch.active)
         self.assertMissing('a')
         self.assertBEqual(self.db['b'], '2')
+
+    def test_sorted_write_batch(self):
+        with self.db.write_batch(batch_size=1, sorted=True) as batch:
+            batch.put('a', '1')
+            batch.delete('b')
+            batch.put('c', '3')
+        self.assertBEqual(list(self.db), [('a', '1'), ('c', '3')])
+
+        with self.assertRaises(ValueError):
+            with self.db.write_batch(sorted=True) as batch:
+                batch.put('z', '1')
+                batch.put('a', '2')
+        self.assertMissing('z')
+
+        with self.assertRaises(ValueError):
+            with self.db.write_batch(sorted=True) as batch:
+                batch.delete_range('a', 'z')
 
         with self.assertRaisesRegex(RuntimeError, 'boom'):
             with self.db.write_batch(batch_size=1) as batch:

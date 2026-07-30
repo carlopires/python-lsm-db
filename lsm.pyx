@@ -104,6 +104,7 @@ cdef extern from "src/lsm.h" nogil:
     cdef int LSM_BATCH_PUT = 1
     cdef int LSM_BATCH_DELETE = 2
     cdef int LSM_BATCH_DELETE_RANGE = 3
+    cdef int LSM_BATCH_SORTED = 1
 
     ctypedef struct lsm_batch_op:
         int eType
@@ -116,6 +117,12 @@ cdef extern from "src/lsm.h" nogil:
         lsm_db *pDb,
         const lsm_batch_op *aOp,
         int nOp,
+        int *piFailed)
+    cdef int lsm_write_batch_ex(
+        lsm_db *pDb,
+        const lsm_batch_op *aOp,
+        int nOp,
+        unsigned int flags,
         int *piFailed)
 
     cdef int lsm_work(lsm_db *pDb, int nMerge, int nKB, int *pnWrite)
@@ -724,7 +731,7 @@ cdef class LSM(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    cdef _native_write_batch(self, list batch):
+    cdef _native_write_batch(self, list batch, bint sorted_input=False):
         """Apply a list of encoded native batch descriptors."""
         cdef:
             Py_ssize_t i
@@ -770,7 +777,12 @@ cdef class LSM(object):
                     ops[i].nVal = <int>vlen
 
             with nogil:
-                rc = lsm_write_batch(self.db, ops, <int>n, &failed)
+                rc = lsm_write_batch_ex(
+                    self.db,
+                    ops,
+                    <int>n,
+                    LSM_BATCH_SORTED if sorted_input else 0,
+                    &failed)
         finally:
             free(ops)
 
@@ -814,7 +826,7 @@ cdef class LSM(object):
                     vlen)
             _check(rc)
 
-    def upsert_many(self, rows, int batch_size=4096):
+    def upsert_many(self, rows, int batch_size=4096, bint sorted=False):
         """
         Atomically upsert an iterable of ``(key, value)`` pairs.
 
@@ -827,6 +839,7 @@ cdef class LSM(object):
         cdef:
             bytes bkey
             bytes bvalue
+            bytes previous = None
             Py_ssize_t count = 0
             list batch = []
 
@@ -840,12 +853,16 @@ cdef class LSM(object):
             for key, value in rows:
                 bkey = encode(key)
                 bvalue = encode(value)
+                if sorted and previous is not None and bkey <= previous:
+                    raise ValueError(
+                        'sorted batch keys must be strictly increasing')
+                previous = bkey
                 batch.append((LSM_BATCH_PUT, bkey, bvalue))
                 count += 1
                 if len(batch) >= batch_size:
-                    self._native_write_batch(batch)
+                    self._native_write_batch(batch, sorted)
                     batch = []
-            self._native_write_batch(batch)
+            self._native_write_batch(batch, sorted)
         except:
             self._rollback(False)
             raise
@@ -854,11 +871,11 @@ cdef class LSM(object):
 
         return count
 
-    def insert_many(self, rows, int batch_size=4096):
+    def insert_many(self, rows, int batch_size=4096, bint sorted=False):
         """Compatibility alias for :py:meth:`upsert_many`."""
-        return self.upsert_many(rows, batch_size)
+        return self.upsert_many(rows, batch_size, sorted)
 
-    def delete_many(self, keys, int batch_size=4096):
+    def delete_many(self, keys, int batch_size=4096, bint sorted=False):
         """
         Atomically delete an iterable of keys.
 
@@ -869,6 +886,7 @@ cdef class LSM(object):
         """
         cdef:
             bytes bkey
+            bytes previous = None
             Py_ssize_t count = 0
             list batch = []
 
@@ -879,12 +897,16 @@ cdef class LSM(object):
         try:
             for key in keys:
                 bkey = encode(key)
+                if sorted and previous is not None and bkey <= previous:
+                    raise ValueError(
+                        'sorted batch keys must be strictly increasing')
+                previous = bkey
                 batch.append((LSM_BATCH_DELETE, bkey, b''))
                 count += 1
                 if len(batch) >= batch_size:
-                    self._native_write_batch(batch)
+                    self._native_write_batch(batch, sorted)
                     batch = []
-            self._native_write_batch(batch)
+            self._native_write_batch(batch, sorted)
         except:
             self._rollback(False)
             raise
@@ -893,7 +915,8 @@ cdef class LSM(object):
 
         return count
 
-    def apply_batch(self, operations, int batch_size=4096):
+    def apply_batch(
+            self, operations, int batch_size=4096, bint sorted=False):
         """
         Atomically apply a mixed iterable of write operations.
 
@@ -911,6 +934,7 @@ cdef class LSM(object):
         cdef:
             bytes bkey
             bytes bvalue
+            bytes previous = None
             int eType
             Py_ssize_t count = 0
             list batch = []
@@ -941,6 +965,9 @@ cdef class LSM(object):
                     bkey = encode(operation[1])
                     bvalue = b''
                 elif kind in ('delete_range', LSM_BATCH_DELETE_RANGE):
+                    if sorted:
+                        raise ValueError(
+                            'sorted batches do not support range deletes')
                     if len(operation) != 3:
                         raise ValueError(
                             'delete_range operation requires two bounds')
@@ -950,12 +977,16 @@ cdef class LSM(object):
                 else:
                     raise ValueError('unknown batch operation: %r' % (kind,))
 
+                if sorted and previous is not None and bkey <= previous:
+                    raise ValueError(
+                        'sorted batch keys must be strictly increasing')
+                previous = bkey
                 batch.append((eType, bkey, bvalue))
                 count += 1
                 if len(batch) >= batch_size:
-                    self._native_write_batch(batch)
+                    self._native_write_batch(batch, sorted)
                     batch = []
-            self._native_write_batch(batch)
+            self._native_write_batch(batch, sorted)
         except:
             self._rollback(False)
             raise
@@ -964,14 +995,14 @@ cdef class LSM(object):
 
         return count
 
-    def write_batch(self, int batch_size=4096):
+    def write_batch(self, int batch_size=4096, bint sorted=False):
         """
         Return a buffered mixed-operation batch context manager.
 
         The context is committed atomically on normal exit and rolled back if
         an exception escapes the block.
         """
-        return WriteBatch.__new__(WriteBatch, self, batch_size)
+        return WriteBatch.__new__(WriteBatch, self, batch_size, sorted)
 
     def update(self, values):
         """
@@ -1733,8 +1764,11 @@ cdef class WriteBatch(object):
         readonly Py_ssize_t processed
         readonly bint active
         bint used
+        bint sorted
+        bytes previous
 
-    def __cinit__(self, LSM lsm, int batch_size=4096):
+    def __cinit__(
+            self, LSM lsm, int batch_size=4096, bint sorted=False):
         if batch_size <= 0:
             raise ValueError('batch_size must be greater than zero')
         self.lsm = lsm
@@ -1743,6 +1777,8 @@ cdef class WriteBatch(object):
         self.processed = 0
         self.active = False
         self.used = False
+        self.sorted = sorted
+        self.previous = None
 
     def __enter__(self):
         if self.active:
@@ -1768,6 +1804,14 @@ cdef class WriteBatch(object):
 
     cdef _append(self, int eType, bytes bkey, bytes bvalue):
         self._check_active()
+        if self.sorted:
+            if eType == LSM_BATCH_DELETE_RANGE:
+                raise ValueError(
+                    'sorted batches do not support range deletes')
+            if self.previous is not None and bkey <= self.previous:
+                raise ValueError(
+                    'sorted batch keys must be strictly increasing')
+            self.previous = bkey
         self._batch.append((eType, bkey, bvalue))
         self.processed += 1
         if len(self._batch) >= self.batch_size:
@@ -1807,7 +1851,7 @@ cdef class WriteBatch(object):
         self._check_active()
         if self._batch:
             try:
-                self.lsm._native_write_batch(self._batch)
+                self.lsm._native_write_batch(self._batch, self.sorted)
             except:
                 self._batch = []
                 self.lsm._rollback(False)

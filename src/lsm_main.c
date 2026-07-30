@@ -662,6 +662,7 @@ int lsm_info(lsm_db *pDb, int eParam, ...){
 static int doWriteOpCore(
   lsm_db *pDb,
   int bDeleteRange,
+  int bAppend,
   const void *pKey, int nKey,     /* Key to write or delete */
   const void *pVal, int nVal      /* Value to write. Or nVal==-1 for a delete */
 ){
@@ -675,6 +676,11 @@ static int doWriteOpCore(
   if( rc==LSM_OK ){
     if( bDeleteRange ){
       rc = lsmTreeDelete(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
+    }else if( bAppend ){
+      rc = lsmTreeInsertAppend(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
+      if( rc==LSM_MISMATCH ){
+        rc = lsmTreeInsert(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
+      }
     }else{
       rc = lsmTreeInsert(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
     }
@@ -722,7 +728,7 @@ static int doWriteOp(
   if( rc==LSM_OK ){
     lsmSortedSaveTreeCursors(pDb);
     nBefore = lsmTreeSize(pDb);
-    rc = doWriteOpCore(pDb, bDeleteRange, pKey, nKey, pVal, nVal);
+    rc = doWriteOpCore(pDb, bDeleteRange, 0, pKey, nKey, pVal, nVal);
   }
   if( rc==LSM_OK ){
     rc = doWriteAutoWork(pDb, nBefore);
@@ -779,10 +785,11 @@ int lsm_delete_range(
 ** even if the caller already has a transaction, so a failed batch can be
 ** rolled back without disturbing earlier work in the caller's transaction.
 */
-int lsm_write_batch(
+int lsm_write_batch_ex(
   lsm_db *db,
   const lsm_batch_op *aOp,
   int nOp,
+  unsigned int flags,
   int *piFailed
 ){
   int rc = LSM_OK;
@@ -793,6 +800,7 @@ int lsm_write_batch(
 
   if( piFailed ) *piFailed = -1;
   if( nOp<0 || (nOp>0 && aOp==0) ) return LSM_MISUSE;
+  if( flags & ~LSM_BATCH_SORTED ) return LSM_MISUSE;
   if( nOp==0 ) return LSM_OK;
 
   /*
@@ -810,8 +818,17 @@ int lsm_write_batch(
       /* The value fields are ignored for a point delete. */
     }else if( p->eType==LSM_BATCH_DELETE_RANGE ){
       if( p->nVal<0 || (p->nVal>0 && p->pVal==0) ) rc = LSM_MISUSE;
+      if( flags & LSM_BATCH_SORTED ) rc = LSM_MISUSE;
     }else{
       rc = LSM_MISUSE;
+    }
+    if( rc==LSM_OK && (flags & LSM_BATCH_SORTED) && i>0 ){
+      const lsm_batch_op *pPrev = &aOp[i-1];
+      if( db->xCmp(
+            (void *)pPrev->pKey, pPrev->nKey, (void *)p->pKey, p->nKey
+          )>=0 ){
+        rc = LSM_MISMATCH;
+      }
     }
     if( rc!=LSM_OK ){
       if( piFailed ) *piFailed = i;
@@ -839,13 +856,18 @@ int lsm_write_batch(
   for(i=0; rc==LSM_OK && i<nOp; i++){
     const lsm_batch_op *p = &aOp[i];
     if( p->eType==LSM_BATCH_PUT ){
-      rc = doWriteOpCore(db, 0, p->pKey, p->nKey, p->pVal, p->nVal);
+      rc = doWriteOpCore(
+          db, 0, (flags & LSM_BATCH_SORTED)!=0,
+          p->pKey, p->nKey, p->pVal, p->nVal
+      );
     }else if( p->eType==LSM_BATCH_DELETE ){
-      rc = doWriteOpCore(db, 0, p->pKey, p->nKey, 0, -1);
+      rc = doWriteOpCore(
+          db, 0, (flags & LSM_BATCH_SORTED)!=0, p->pKey, p->nKey, 0, -1
+      );
     }else if( db->xCmp(
           (void *)p->pKey, p->nKey, (void *)p->pVal, p->nVal
         )<0 ){
-      rc = doWriteOpCore(db, 1, p->pKey, p->nKey, p->pVal, p->nVal);
+      rc = doWriteOpCore(db, 1, 0, p->pKey, p->nKey, p->pVal, p->nVal);
     }
     if( rc!=LSM_OK && piFailed ) *piFailed = i;
   }
@@ -869,6 +891,15 @@ int lsm_write_batch(
   }
 
   return rc;
+}
+
+int lsm_write_batch(
+  lsm_db *db,
+  const lsm_batch_op *aOp,
+  int nOp,
+  int *piFailed
+){
+  return lsm_write_batch_ex(db, aOp, nOp, 0, piFailed);
 }
 
 /*

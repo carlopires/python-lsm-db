@@ -1444,7 +1444,8 @@ static int treeInsertEntry(
   void *pKey,                     /* Pointer to key data */
   int nKey,                       /* Size of key data in bytes */
   void *pVal,                     /* Pointer to value data (or NULL) */
-  int nVal                        /* Bytes in value data (or -ve for delete) */
+  int nVal,                       /* Bytes in value data (or -ve for delete) */
+  int bAppend                     /* Key is expected after current maximum */
 ){
   int rc = LSM_OK;                /* Return Code */
   TreeKey *pTreeKey;              /* New key-value being inserted */
@@ -1467,11 +1468,27 @@ static int treeInsertEntry(
     TreeKey *pRes;                /* Key at end of seek operation */
     treeCursorInit(pDb, 0, &csr);
 
-    /* Seek to the leaf (or internal node) that the new key belongs on */
-    rc = lsmTreeCursorSeek(&csr, pKey, nKey, &res);
+    /*
+    ** For a validated append, descend the right edge without comparing at
+    ** every tree level. If the key is not beyond the current maximum, report
+    ** MISMATCH before allocating or mutating data so the caller can fall
+    ** back to a normal seek.
+    */
+    if( bAppend ){
+      rc = lsmTreeCursorEnd(&csr, 1);
+    }else{
+      rc = lsmTreeCursorSeek(&csr, pKey, nKey, &res);
+    }
     pRes = csrGetKey(&csr, &csr.blob, &rc);
     if( rc!=LSM_OK ) return rc;
     assert( pRes );
+    if( bAppend ){
+      if( treeKeycmp(TKV_KEY(pRes), pRes->nKey, pKey, nKey)>=0 ){
+        tblobFree(pDb, &csr.blob);
+        return LSM_MISMATCH;
+      }
+      res = -1;
+    }
 
     if( flags==LSM_START_DELETE ){
       /* When inserting a start-delete-range entry, if the key that
@@ -1585,7 +1602,23 @@ int lsmTreeInsert(
     flags = LSM_INSERT;
   }
 
-  return treeInsertEntry(pDb, flags, pKey, nKey, pVal, nVal);
+  return treeInsertEntry(pDb, flags, pKey, nKey, pVal, nVal, 0);
+}
+
+/*
+** Insert a key expected to sort after every key in the live tree. The
+** precondition is checked before mutation. LSM_MISMATCH means the caller may
+** safely retry using lsmTreeInsert().
+*/
+int lsmTreeInsertAppend(
+  lsm_db *pDb,
+  void *pKey,
+  int nKey,
+  void *pVal,
+  int nVal
+){
+  int flags = (nVal<0 ? LSM_POINT_DELETE : LSM_INSERT);
+  return treeInsertEntry(pDb, flags, pKey, nKey, pVal, nVal, 1);
 }
 
 static int treeDeleteEntry(lsm_db *db, TreeCursor *pCsr, u32 iNewptr){
@@ -1889,13 +1922,13 @@ int lsmTreeDelete(
 
   /* Now insert the START_DELETE and END_DELETE keys. */
   if( rc==LSM_OK ){
-    rc = treeInsertEntry(db, LSM_START_DELETE, pKey1, nKey1, 0, -1);
+    rc = treeInsertEntry(db, LSM_START_DELETE, pKey1, nKey1, 0, -1, 0);
   }
 #if 0
   dump_tree_contents(db, "during delete 2");
 #endif
   if( rc==LSM_OK ){
-    rc = treeInsertEntry(db, LSM_END_DELETE, pKey2, nKey2, 0, -1);
+    rc = treeInsertEntry(db, LSM_END_DELETE, pKey2, nKey2, 0, -1, 0);
   }
 
 #if 0

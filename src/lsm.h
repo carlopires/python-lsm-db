@@ -546,6 +546,13 @@ int lsm_delete_range(lsm_db *,
 #define LSM_BATCH_DELETE       2
 #define LSM_BATCH_DELETE_RANGE 3
 
+/*
+** Require point-operation keys to be strictly increasing. Sorted batches
+** use the live tree's append path once they pass its current maximum. Range
+** deletes are not accepted in a sorted batch.
+*/
+#define LSM_BATCH_SORTED       0x0001
+
 typedef struct lsm_batch_op {
   int eType;
   const void *pKey;
@@ -558,6 +565,14 @@ int lsm_write_batch(
     lsm_db *,
     const lsm_batch_op *aOp,
     int nOp,
+    int *piFailed
+);
+
+int lsm_write_batch_ex(
+    lsm_db *,
+    const lsm_batch_op *aOp,
+    int nOp,
+    unsigned int flags,
     int *piFailed
 );
 
