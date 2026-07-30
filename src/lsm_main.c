@@ -654,6 +654,56 @@ int lsm_info(lsm_db *pDb, int eParam, ...){
   return rc;
 }
 
+/*
+** Append one write operation to the log and live tree. Transaction handling,
+** cursor preservation and autowork are deliberately owned by the caller so
+** a native batch can perform each of those once per chunk.
+*/
+static int doWriteOpCore(
+  lsm_db *pDb,
+  int bDeleteRange,
+  const void *pKey, int nKey,     /* Key to write or delete */
+  const void *pVal, int nVal      /* Value to write. Or nVal==-1 for a delete */
+){
+  int rc = LSM_OK;                /* Return code */
+
+  {
+    int eType = (bDeleteRange ? LSM_DRANGE : (nVal>=0?LSM_WRITE:LSM_DELETE));
+    rc = lsmLogWrite(pDb, eType, (void *)pKey, nKey, (void *)pVal, nVal);
+  }
+
+  if( rc==LSM_OK ){
+    if( bDeleteRange ){
+      rc = lsmTreeDelete(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
+    }else{
+      rc = lsmTreeInsert(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
+    }
+  }
+
+  return rc;
+}
+
+/*
+** Run automatic sorted-tree work for the aggregate live-tree growth since
+** nBefore. This preserves the existing quantized policy while allowing a
+** batch to calculate it once instead of once per operation.
+*/
+static int doWriteAutoWork(lsm_db *pDb, int nBefore){
+  int pgsz = lsmFsPageSize(pDb->pFS);
+  int nQuant = LSM_AUTOWORK_QUANT * pgsz;
+  int nAfter = lsmTreeSize(pDb);
+  int nDiff;
+
+  if( nQuant>pDb->nTreeLimit ){
+    nQuant = LSM_MAX(pDb->nTreeLimit, pgsz);
+  }
+  nDiff = (nAfter/nQuant) - (nBefore/nQuant);
+  if( pDb->bAutowork && nDiff!=0 ){
+    return lsmSortedAutoWork(pDb, nDiff * LSM_AUTOWORK_QUANT);
+  }
+  return LSM_OK;
+}
+
 static int doWriteOp(
   lsm_db *pDb,
   int bDeleteRange,
@@ -662,6 +712,7 @@ static int doWriteOp(
 ){
   int rc = LSM_OK;                /* Return code */
   int bCommit = 0;                /* True to commit before returning */
+  int nBefore = 0;
 
   if( pDb->nTransOpen==0 ){
     bCommit = 1;
@@ -669,35 +720,12 @@ static int doWriteOp(
   }
 
   if( rc==LSM_OK ){
-    int eType = (bDeleteRange ? LSM_DRANGE : (nVal>=0?LSM_WRITE:LSM_DELETE));
-    rc = lsmLogWrite(pDb, eType, (void *)pKey, nKey, (void *)pVal, nVal);
-  }
-
-  lsmSortedSaveTreeCursors(pDb);
-
-  if( rc==LSM_OK ){
-    int pgsz = lsmFsPageSize(pDb->pFS);
-    int nQuant = LSM_AUTOWORK_QUANT * pgsz;
-    int nBefore;
-    int nAfter;
-    int nDiff;
-
-    if( nQuant>pDb->nTreeLimit ){
-      nQuant = LSM_MAX(pDb->nTreeLimit, pgsz);
-    }
-
+    lsmSortedSaveTreeCursors(pDb);
     nBefore = lsmTreeSize(pDb);
-    if( bDeleteRange ){
-      rc = lsmTreeDelete(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
-    }else{
-      rc = lsmTreeInsert(pDb, (void *)pKey, nKey, (void *)pVal, nVal);
-    }
-
-    nAfter = lsmTreeSize(pDb);
-    nDiff = (nAfter/nQuant) - (nBefore/nQuant);
-    if( rc==LSM_OK && pDb->bAutowork && nDiff!=0 ){
-      rc = lsmSortedAutoWork(pDb, nDiff * LSM_AUTOWORK_QUANT);
-    }
+    rc = doWriteOpCore(pDb, bDeleteRange, pKey, nKey, pVal, nVal);
+  }
+  if( rc==LSM_OK ){
+    rc = doWriteAutoWork(pDb, nBefore);
   }
 
   /* If a transaction was opened at the start of this function, commit it. 
@@ -761,6 +789,7 @@ int lsm_write_batch(
   int i;
   int iOuter;
   int iBatch;
+  int nBefore = 0;
 
   if( piFailed ) *piFailed = -1;
   if( nOp<0 || (nOp>0 && aOp==0) ) return LSM_MISUSE;
@@ -794,18 +823,35 @@ int lsm_write_batch(
   iBatch = iOuter + 1;
   rc = lsm_begin(db, iBatch);
 
+  if( rc==LSM_OK ){
+    /*
+    ** A checksum record is emitted at least every 32 KiB, so reserving one
+    ** checksum window amortizes allocation without allowing memory use to
+    ** scale with an arbitrarily large caller-supplied batch.
+    */
+    rc = lsmLogReserve(db, 32*1024);
+  }
+  if( rc==LSM_OK ){
+    lsmSortedSaveTreeCursors(db);
+    nBefore = lsmTreeSize(db);
+  }
+
   for(i=0; rc==LSM_OK && i<nOp; i++){
     const lsm_batch_op *p = &aOp[i];
     if( p->eType==LSM_BATCH_PUT ){
-      rc = doWriteOp(db, 0, p->pKey, p->nKey, p->pVal, p->nVal);
+      rc = doWriteOpCore(db, 0, p->pKey, p->nKey, p->pVal, p->nVal);
     }else if( p->eType==LSM_BATCH_DELETE ){
-      rc = doWriteOp(db, 0, p->pKey, p->nKey, 0, -1);
+      rc = doWriteOpCore(db, 0, p->pKey, p->nKey, 0, -1);
     }else if( db->xCmp(
           (void *)p->pKey, p->nKey, (void *)p->pVal, p->nVal
         )<0 ){
-      rc = doWriteOp(db, 1, p->pKey, p->nKey, p->pVal, p->nVal);
+      rc = doWriteOpCore(db, 1, p->pKey, p->nKey, p->pVal, p->nVal);
     }
     if( rc!=LSM_OK && piFailed ) *piFailed = i;
+  }
+
+  if( rc==LSM_OK ){
+    rc = doWriteAutoWork(db, nBefore);
   }
 
   if( rc==LSM_OK ){

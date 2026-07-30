@@ -232,6 +232,18 @@ struct LogWriter {
 };
 
 /*
+** Ensure that the current log buffer has room for at least nByte more bytes.
+** Native write batches use this to avoid growing the buffer separately for
+** each small record. The reservation is only a capacity hint and does not
+** change the logical contents of the log.
+*/
+int lsmLogReserve(lsm_db *pDb, int nByte){
+  if( pDb->bUseLog==0 || nByte<=0 ) return LSM_OK;
+  assert( pDb->pLogWriter );
+  return lsmStringExtend(&pDb->pLogWriter->buf, nByte);
+}
+
+/*
 ** Return the result of interpreting the first 4 bytes in buffer aIn as 
 ** a 32-bit unsigned little-endian integer.
 */
