@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqlite-lsm1"
-version = "0.8.0"
+version = "0.9.0"
 description = "Python bindings for SQLite's LSM1 key/value store"
 readme = "README.md"
 requires-python = ">=3.9"
