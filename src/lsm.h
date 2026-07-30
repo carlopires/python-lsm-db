@@ -531,6 +531,37 @@ int lsm_delete_range(lsm_db *,
 );
 
 /*
+** CAPI: Applying a Batch of Writes
+**
+** A batch may contain any mixture of puts, point deletes and range deletes.
+** Operations are applied in array order. The complete batch is atomic, even
+** when invoked from within an existing transaction. On failure, the database
+** is restored to its state before the batch and *piFailed (if non-NULL) is
+** set to the index of the operation that failed.
+**
+** The key and value buffers are copied before this function returns. They do
+** not need to remain valid after lsm_write_batch() completes.
+*/
+#define LSM_BATCH_PUT          1
+#define LSM_BATCH_DELETE       2
+#define LSM_BATCH_DELETE_RANGE 3
+
+typedef struct lsm_batch_op {
+  int eType;
+  const void *pKey;
+  int nKey;
+  const void *pVal;
+  int nVal;
+} lsm_batch_op;
+
+int lsm_write_batch(
+    lsm_db *,
+    const lsm_batch_op *aOp,
+    int nOp,
+    int *piFailed
+);
+
+/*
 ** CAPI: Explicit Database Work and Checkpointing
 **
 ** This function is called by a thread to work on the database structure.

@@ -4,6 +4,8 @@ from cpython.bytes cimport PyBytes_Check
 from cpython.unicode cimport PyUnicode_AsUTF8String
 from cpython.unicode cimport PyUnicode_Check
 from cpython.version cimport PY_MAJOR_VERSION
+from libc.limits cimport INT_MAX
+from libc.stdlib cimport free, malloc
 import struct
 import sys
 from threading import RLock, get_ident
@@ -98,6 +100,23 @@ cdef extern from "src/lsm.h" nogil:
     cdef int lsm_insert(lsm_db *pDb, const void *pKey, int nKey, const void *pVal, int nVal)
     cdef int lsm_delete(lsm_db *pDb, const void *pKey, int nKey)
     cdef int lsm_delete_range(lsm_db *pDb, const void *pKey, int nKey, const void *pKey2, int nKey2)
+
+    cdef int LSM_BATCH_PUT = 1
+    cdef int LSM_BATCH_DELETE = 2
+    cdef int LSM_BATCH_DELETE_RANGE = 3
+
+    ctypedef struct lsm_batch_op:
+        int eType
+        const void *pKey
+        int nKey
+        const void *pVal
+        int nVal
+
+    cdef int lsm_write_batch(
+        lsm_db *pDb,
+        const lsm_batch_op *aOp,
+        int nOp,
+        int *piFailed)
 
     cdef int lsm_work(lsm_db *pDb, int nMerge, int nKB, int *pnWrite)
     cdef int lsm_flush(lsm_db *pDb)
@@ -228,6 +247,16 @@ cdef inline _check(int rc):
         base_rc = rc & 0xff
         exc_class = EXC_MAPPING.get(base_rc, Exception)
         raise exc_class(EXC_MESSAGE_MAPPING.get(base_rc, 'Unknown error'))
+
+cdef inline _check_batch(int rc, int failed):
+    """Check a native batch result and preserve its failing operation index."""
+    if rc != LSM_OK:
+        base_rc = rc & 0xff
+        exc_class = EXC_MAPPING.get(base_rc, Exception)
+        message = EXC_MESSAGE_MAPPING.get(base_rc, 'Unknown error')
+        if failed >= 0:
+            message = '%s (batch operation %d)' % (message, failed)
+        raise exc_class(message)
 
 cdef bint IS_PY3K = sys.version_info[0] == 3
 
@@ -695,6 +724,58 @@ cdef class LSM(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    cdef _native_write_batch(self, list batch):
+        """Apply a list of encoded native batch descriptors."""
+        cdef:
+            Py_ssize_t i
+            Py_ssize_t n = len(batch)
+            Py_ssize_t klen
+            Py_ssize_t vlen
+            bytes bkey
+            bytes bvalue
+            char *kbuf
+            char *vbuf
+            int eType
+            int failed = -1
+            int rc = LSM_OK
+            lsm_batch_op *ops = NULL
+
+        if n == 0:
+            return
+        if n > INT_MAX:
+            raise OverflowError('native batch contains too many operations')
+
+        ops = <lsm_batch_op *>malloc(n * sizeof(lsm_batch_op))
+        if ops == NULL:
+            raise MemoryError()
+
+        try:
+            for i in range(n):
+                eType, bkey, bvalue = batch[i]
+                PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
+                if klen > INT_MAX:
+                    raise OverflowError('batch key is too large')
+
+                ops[i].eType = eType
+                ops[i].pKey = kbuf
+                ops[i].nKey = <int>klen
+                if eType == LSM_BATCH_DELETE:
+                    ops[i].pVal = NULL
+                    ops[i].nVal = 0
+                else:
+                    PyBytes_AsStringAndSize(bvalue, &vbuf, &vlen)
+                    if vlen > INT_MAX:
+                        raise OverflowError('batch value is too large')
+                    ops[i].pVal = vbuf
+                    ops[i].nVal = <int>vlen
+
+            with nogil:
+                rc = lsm_write_batch(self.db, ops, <int>n, &failed)
+        finally:
+            free(ops)
+
+        _check_batch(rc, failed)
+
     cpdef insert(self, key, value):
         """
         Insert a key/value pair to the database. If the key exists, the
@@ -733,9 +814,9 @@ cdef class LSM(object):
                     vlen)
             _check(rc)
 
-    def insert_many(self, rows):
+    def upsert_many(self, rows, int batch_size=4096):
         """
-        Atomically insert an iterable of ``(key, value)`` pairs.
+        Atomically upsert an iterable of ``(key, value)`` pairs.
 
         A mapping may be supplied directly. The batch uses one nested
         transaction, streams its input without materializing it, and rolls
@@ -746,35 +827,25 @@ cdef class LSM(object):
         cdef:
             bytes bkey
             bytes bvalue
-            char *kbuf
-            char *vbuf
-            int rc
             Py_ssize_t count = 0
-            Py_ssize_t klen, vlen
+            list batch = []
 
         if hasattr(rows, 'items'):
             rows = rows.items()
+        if batch_size <= 0:
+            raise ValueError('batch_size must be greater than zero')
 
         self.begin()
         try:
             for key, value in rows:
                 bkey = encode(key)
                 bvalue = encode(value)
-                PyBytes_AsStringAndSize(bkey, &kbuf, &klen)
-                PyBytes_AsStringAndSize(bvalue, &vbuf, &vlen)
-
-                # begin() retains the re-entrant connection lock for the
-                # lifetime of this transaction, so the handle and buffers are
-                # stable while Python executes other threads.
-                with nogil:
-                    rc = lsm_insert(
-                        self.db,
-                        kbuf,
-                        klen,
-                        vbuf,
-                        vlen)
-                _check(rc)
+                batch.append((LSM_BATCH_PUT, bkey, bvalue))
                 count += 1
+                if len(batch) >= batch_size:
+                    self._native_write_batch(batch)
+                    batch = []
+            self._native_write_batch(batch)
         except:
             self._rollback(False)
             raise
@@ -782,6 +853,125 @@ cdef class LSM(object):
             self._commit()
 
         return count
+
+    def insert_many(self, rows, int batch_size=4096):
+        """Compatibility alias for :py:meth:`upsert_many`."""
+        return self.upsert_many(rows, batch_size)
+
+    def delete_many(self, keys, int batch_size=4096):
+        """
+        Atomically delete an iterable of keys.
+
+        Missing keys are accepted, matching :py:meth:`delete`. Input is
+        streamed through bounded native batches.
+
+        :returns: Number of keys processed.
+        """
+        cdef:
+            bytes bkey
+            Py_ssize_t count = 0
+            list batch = []
+
+        if batch_size <= 0:
+            raise ValueError('batch_size must be greater than zero')
+
+        self.begin()
+        try:
+            for key in keys:
+                bkey = encode(key)
+                batch.append((LSM_BATCH_DELETE, bkey, b''))
+                count += 1
+                if len(batch) >= batch_size:
+                    self._native_write_batch(batch)
+                    batch = []
+            self._native_write_batch(batch)
+        except:
+            self._rollback(False)
+            raise
+        else:
+            self._commit()
+
+        return count
+
+    def apply_batch(self, operations, int batch_size=4096):
+        """
+        Atomically apply a mixed iterable of write operations.
+
+        Operations are tuples in one of the following forms:
+
+        * ``('put', key, value)``
+        * ``('delete', key)``
+        * ``('delete_range', start, end)``
+
+        Integer ``BATCH_*`` constants may be used instead of the string
+        operation names. Operations are applied in input order.
+
+        :returns: Number of operations processed.
+        """
+        cdef:
+            bytes bkey
+            bytes bvalue
+            int eType
+            Py_ssize_t count = 0
+            list batch = []
+
+        if batch_size <= 0:
+            raise ValueError('batch_size must be greater than zero')
+
+        self.begin()
+        try:
+            for operation in operations:
+                if not isinstance(operation, (tuple, list)):
+                    raise TypeError('batch operations must be tuples or lists')
+                if len(operation) == 0:
+                    raise ValueError('batch operation cannot be empty')
+
+                kind = operation[0]
+                if kind in ('put', 'upsert', 'insert', 'update',
+                            LSM_BATCH_PUT):
+                    if len(operation) != 3:
+                        raise ValueError('put operation requires key and value')
+                    eType = LSM_BATCH_PUT
+                    bkey = encode(operation[1])
+                    bvalue = encode(operation[2])
+                elif kind in ('delete', LSM_BATCH_DELETE):
+                    if len(operation) != 2:
+                        raise ValueError('delete operation requires one key')
+                    eType = LSM_BATCH_DELETE
+                    bkey = encode(operation[1])
+                    bvalue = b''
+                elif kind in ('delete_range', LSM_BATCH_DELETE_RANGE):
+                    if len(operation) != 3:
+                        raise ValueError(
+                            'delete_range operation requires two bounds')
+                    eType = LSM_BATCH_DELETE_RANGE
+                    bkey = encode(operation[1])
+                    bvalue = encode(operation[2])
+                else:
+                    raise ValueError('unknown batch operation: %r' % (kind,))
+
+                batch.append((eType, bkey, bvalue))
+                count += 1
+                if len(batch) >= batch_size:
+                    self._native_write_batch(batch)
+                    batch = []
+            self._native_write_batch(batch)
+        except:
+            self._rollback(False)
+            raise
+        else:
+            self._commit()
+
+        return count
+
+    def write_batch(self, int batch_size=4096):
+        """
+        Return a buffered mixed-operation batch context manager.
+
+        The context is committed atomically on normal exit and rolled back if
+        an exception escapes the block.
+        """
+        return WriteBatch.__new__(WriteBatch, self, batch_size)
 
     def update(self, values):
         """
@@ -792,7 +982,7 @@ cdef class LSM(object):
 
         :param values: A mapping of key/value pairs.
         """
-        self.insert_many(values.items())
+        self.upsert_many(values.items())
 
     cpdef fetch(self, key, int seek_method=LSM_SEEK_EQ):
         """
@@ -1529,6 +1719,129 @@ cdef class LSM(object):
         return Cursor.__new__(Cursor, self, reverse)
 
 
+cdef class WriteBatch(object):
+    """
+    Buffered, atomic mixed-operation write batch.
+
+    Instances are created with :py:meth:`LSM.write_batch` and must be used as
+    context managers.
+    """
+    cdef:
+        LSM lsm
+        list _batch
+        int batch_size
+        readonly Py_ssize_t processed
+        readonly bint active
+        bint used
+
+    def __cinit__(self, LSM lsm, int batch_size=4096):
+        if batch_size <= 0:
+            raise ValueError('batch_size must be greater than zero')
+        self.lsm = lsm
+        self.batch_size = batch_size
+        self._batch = []
+        self.processed = 0
+        self.active = False
+        self.used = False
+
+    def __enter__(self):
+        if self.active:
+            raise RuntimeError('write batch is already active')
+        if self.used:
+            raise RuntimeError('write batch cannot be reused')
+        self.lsm.begin()
+        self.active = True
+        self.used = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.active:
+            return
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+
+    cdef _check_active(self):
+        if not self.active:
+            raise RuntimeError('write batch is not active')
+
+    cdef _append(self, int eType, bytes bkey, bytes bvalue):
+        self._check_active()
+        self._batch.append((eType, bkey, bvalue))
+        self.processed += 1
+        if len(self._batch) >= self.batch_size:
+            self.flush()
+
+    def put(self, key, value):
+        """Buffer an unconditional insert-or-replace operation."""
+        cdef:
+            bytes bkey = encode(key)
+            bytes bvalue = encode(value)
+        self._append(LSM_BATCH_PUT, bkey, bvalue)
+        return self
+
+    def upsert(self, key, value):
+        """Alias for :py:meth:`put`."""
+        return self.put(key, value)
+
+    def delete(self, key):
+        """Buffer a point delete."""
+        cdef bytes bkey = encode(key)
+        self._append(LSM_BATCH_DELETE, bkey, b'')
+        return self
+
+    def delete_range(self, start, end):
+        """Buffer an exclusive-bound range delete."""
+        cdef:
+            bytes bstart = encode(start)
+            bytes bend = encode(end)
+        self._append(LSM_BATCH_DELETE_RANGE, bstart, bend)
+        return self
+
+    def flush(self):
+        """
+        Send buffered descriptors to the native engine without committing the
+        surrounding batch transaction.
+        """
+        self._check_active()
+        if self._batch:
+            try:
+                self.lsm._native_write_batch(self._batch)
+            except:
+                self._batch = []
+                self.lsm._rollback(False)
+                self.active = False
+                raise
+            self._batch = []
+        return self.processed
+
+    def commit(self):
+        """Flush and atomically commit this batch."""
+        self._check_active()
+        self.flush()
+        try:
+            self.lsm._commit()
+        finally:
+            # LSM._commit() closes the transaction level even if committing
+            # the outermost transaction reports an error.
+            self.active = False
+        return self.processed
+
+    def rollback(self):
+        """Discard buffered and already-flushed operations in this batch."""
+        self._check_active()
+        self._batch = []
+        try:
+            self.lsm._rollback(False)
+        finally:
+            self.active = False
+        return self.processed
+
+    def __len__(self):
+        return self.processed
+
+
 cdef class Cursor(object):
     """
     Wrapper around the `lsm_cursor` object.
@@ -1997,4 +2310,8 @@ SEEK_LEFAST = LSM_SEEK_LEFAST
 SEEK_LE = LSM_SEEK_LE
 SEEK_EQ = LSM_SEEK_EQ
 SEEK_GE = LSM_SEEK_GE
+
+BATCH_PUT = LSM_BATCH_PUT
+BATCH_DELETE = LSM_BATCH_DELETE
+BATCH_DELETE_RANGE = LSM_BATCH_DELETE_RANGE
 """ADD: # cython: profile=True to top of file to use with cProfile."""

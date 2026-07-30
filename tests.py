@@ -74,7 +74,7 @@ class TestLSM(BaseTestLSM):
 
     def test_insert_many(self):
         rows = ((('k%s' % i), ('v%s' % i)) for i in range(4))
-        self.assertEqual(self.db.insert_many(rows), 4)
+        self.assertEqual(self.db.insert_many(rows, batch_size=2), 4)
         self.assertBEqual(list(self.db), [
             ('k0', 'v0'),
             ('k1', 'v1'),
@@ -87,6 +87,88 @@ class TestLSM(BaseTestLSM):
         self.assertBEqual(self.db['k1'], 'replaced')
         self.assertBEqual(self.db['k4'], 'v4')
         self.assertEqual(self.db.insert_many([]), 0)
+
+    def test_upsert_many(self):
+        self.db['existing'] = 'old'
+        rows = [('existing', 'new'), ('created', 'value')]
+        self.assertEqual(self.db.upsert_many(rows, batch_size=1), 2)
+        self.assertBEqual(self.db['existing'], 'new')
+        self.assertBEqual(self.db['created'], 'value')
+        self.assertRaises(ValueError, self.db.upsert_many, [], 0)
+
+    def test_delete_many(self):
+        self.db.upsert_many((('k%s' % i, 'v%s' % i) for i in range(5)))
+        self.assertEqual(
+            self.db.delete_many(['k0', 'missing', 'k2', 'k4'],
+                                batch_size=2),
+            4)
+        self.assertBEqual(list(self.db), [('k1', 'v1'), ('k3', 'v3')])
+        self.assertEqual(self.db.delete_many([]), 0)
+        self.assertRaises(ValueError, self.db.delete_many, [], 0)
+
+    def test_delete_many_is_atomic(self):
+        self.db.upsert_many({'keep-1': '1', 'keep-2': '2'})
+
+        def invalid_keys():
+            yield 'keep-1'
+            yield None
+
+        self.assertRaises(
+            TypeError, self.db.delete_many, invalid_keys(), 1)
+        self.assertBEqual(self.db['keep-1'], '1')
+        self.assertBEqual(self.db['keep-2'], '2')
+        self.assertEqual(self.db.transaction_depth, 0)
+
+    def test_apply_batch(self):
+        operations = [
+            ('put', 'a', '1'),
+            (lsm.BATCH_PUT, 'b', '2'),
+            ('put', 'c', '3'),
+            ('delete', 'b'),
+            ('delete_range', 'a', 'z'),
+            ('put', 'z', 'last'),
+        ]
+        self.assertEqual(self.db.apply_batch(operations, batch_size=2), 6)
+        self.assertBEqual(list(self.db), [('a', '1'), ('z', 'last')])
+
+    def test_apply_batch_is_atomic(self):
+        operations = [
+            ('put', 'first', 'value'),
+            ('delete', 'missing'),
+            ('unknown', 'bad'),
+        ]
+        self.assertRaises(
+            ValueError, self.db.apply_batch, operations, 1)
+        self.assertMissing('first')
+        self.assertEqual(self.db.transaction_depth, 0)
+
+    def test_write_batch(self):
+        with self.db.write_batch(batch_size=1) as batch:
+            batch.put('a', '1').upsert('b', '2')
+            batch.delete('a')
+            self.assertEqual(batch.processed, 3)
+            self.assertTrue(batch.active)
+
+        self.assertFalse(batch.active)
+        self.assertMissing('a')
+        self.assertBEqual(self.db['b'], '2')
+
+        with self.assertRaisesRegex(RuntimeError, 'boom'):
+            with self.db.write_batch(batch_size=1) as batch:
+                batch.put('rolled-back', 'value')
+                raise RuntimeError('boom')
+        self.assertMissing('rolled-back')
+
+    def test_write_batch_nested_transaction(self):
+        with self.db.transaction():
+            self.db['outer'] = 'value'
+            with self.db.write_batch(batch_size=1) as batch:
+                batch.put('inner', 'value')
+            self.assertBEqual(self.db['inner'], 'value')
+            self.db.rollback()
+
+        self.assertMissing('outer')
+        self.assertMissing('inner')
 
     def test_insert_many_is_atomic(self):
         def invalid_rows():

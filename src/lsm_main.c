@@ -747,6 +747,85 @@ int lsm_delete_range(
 }
 
 /*
+** Apply an atomic batch of write operations. A nested transaction is opened
+** even if the caller already has a transaction, so a failed batch can be
+** rolled back without disturbing earlier work in the caller's transaction.
+*/
+int lsm_write_batch(
+  lsm_db *db,
+  const lsm_batch_op *aOp,
+  int nOp,
+  int *piFailed
+){
+  int rc = LSM_OK;
+  int i;
+  int iOuter;
+  int iBatch;
+
+  if( piFailed ) *piFailed = -1;
+  if( nOp<0 || (nOp>0 && aOp==0) ) return LSM_MISUSE;
+  if( nOp==0 ) return LSM_OK;
+
+  /*
+  ** Validate descriptor shapes before opening the transaction. Pointer
+  ** validity beyond NULL checks remains the caller's responsibility, just as
+  ** it is for lsm_insert() and lsm_delete().
+  */
+  for(i=0; i<nOp; i++){
+    const lsm_batch_op *p = &aOp[i];
+    if( p->nKey<0 || (p->nKey>0 && p->pKey==0) ){
+      rc = LSM_MISUSE;
+    }else if( p->eType==LSM_BATCH_PUT ){
+      if( p->nVal<0 || (p->nVal>0 && p->pVal==0) ) rc = LSM_MISUSE;
+    }else if( p->eType==LSM_BATCH_DELETE ){
+      /* The value fields are ignored for a point delete. */
+    }else if( p->eType==LSM_BATCH_DELETE_RANGE ){
+      if( p->nVal<0 || (p->nVal>0 && p->pVal==0) ) rc = LSM_MISUSE;
+    }else{
+      rc = LSM_MISUSE;
+    }
+    if( rc!=LSM_OK ){
+      if( piFailed ) *piFailed = i;
+      return rc;
+    }
+  }
+
+  iOuter = db->nTransOpen;
+  iBatch = iOuter + 1;
+  rc = lsm_begin(db, iBatch);
+
+  for(i=0; rc==LSM_OK && i<nOp; i++){
+    const lsm_batch_op *p = &aOp[i];
+    if( p->eType==LSM_BATCH_PUT ){
+      rc = doWriteOp(db, 0, p->pKey, p->nKey, p->pVal, p->nVal);
+    }else if( p->eType==LSM_BATCH_DELETE ){
+      rc = doWriteOp(db, 0, p->pKey, p->nKey, 0, -1);
+    }else if( db->xCmp(
+          (void *)p->pKey, p->nKey, (void *)p->pVal, p->nVal
+        )<0 ){
+      rc = doWriteOp(db, 1, p->pKey, p->nKey, p->pVal, p->nVal);
+    }
+    if( rc!=LSM_OK && piFailed ) *piFailed = i;
+  }
+
+  if( rc==LSM_OK ){
+    rc = lsm_commit(db, iOuter);
+  }else if( iOuter==0 ){
+    lsm_rollback(db, 0);
+  }else{
+    /*
+    ** lsm_rollback(N) restores level N but leaves it open. Restore the
+    ** batch savepoint, then close that now-empty nested level.
+    */
+    int rc2 = lsm_rollback(db, iBatch);
+    if( rc2==LSM_OK ) rc2 = lsm_commit(db, iOuter);
+    if( rc2!=LSM_OK ) rc = rc2;
+  }
+
+  return rc;
+}
+
+/*
 ** Open a new cursor handle. 
 **
 ** If there are currently no other open cursor handles, and no open write
