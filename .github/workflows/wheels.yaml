@@ -26,7 +26,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: dist/lsm*.tar.gz
+          path: dist/sqlite_lsm1-*.tar.gz
 
   wheels:
     runs-on: ${{ matrix.os }}
@@ -61,6 +61,11 @@ jobs:
   publish:
     needs: [sdist, wheels]
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sqlite-lsm1
+    permissions:
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -75,6 +80,3 @@ jobs:
           merge-multiple: true
 
       - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,7 +1,8 @@
 # Repository Overview
 
 This is a compact, mature Cython binding around SQLite’s experimental LSM1
-key/value engine. The checkout was reviewed on `master` at version 0.7.3. It
+key/value engine, distributed as ``sqlite-lsm1``. The checkout was reviewed
+on `master` and prepared for its first fork release as version 0.8.0. It
 contains 32 tracked files, about 25K lines, and 103 commits dating from 2015
 to January 2026.
 

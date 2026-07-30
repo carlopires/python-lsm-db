@@ -3,8 +3,8 @@ requires = ["setuptools>=77", "wheel", "cython>=3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lsm-db"
-version = "0.7.3"
+name = "sqlite-lsm1"
+version = "0.8.0"
 description = "Python bindings for SQLite's LSM1 key/value store"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,6 +12,9 @@ license = "MIT"
 license-files = ["LICENSE", "SQLITE_LICENSE"]
 authors = [
     { name = "Charles Leifer", email = "coleifer@gmail.com" }
+]
+maintainers = [
+    { name = "Carlo Pires", email = "carlopires@gmail.com" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -28,5 +31,6 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/coleifer/python-lsm-db"
-Documentation = "https://lsm-db.readthedocs.io/"
+Repository = "https://github.com/carlopires/python-lsm-db"
+Documentation = "https://github.com/carlopires/python-lsm-db/tree/master/docs"
+Issues = "https://github.com/carlopires/python-lsm-db/issues"

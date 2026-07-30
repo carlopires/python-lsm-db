@@ -1,10 +1,10 @@
-.. lsm-db documentation master file, created by
+.. sqlite-lsm1 documentation master file, created by
    sphinx-quickstart on Mon Aug  3 01:29:51 2015.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-python lsm-db
-=============
+sqlite-lsm1
+===========
 
 Fast Python bindings for `SQLite's LSM1 key/value store
 <https://sqlite.org/src/dir?ci=trunk&name=ext/lsm1>`_. LSM1 originated in the
@@ -25,10 +25,13 @@ Features:
 The durable database is stored in one main file. While it is open, LSM1 also
 uses ``-log`` and ``-shm`` sidecar files for recovery and shared state.
 
-The source for Python lsm-db is `hosted on GitHub <https://github.com/coleifer/python-lsm-db>`_.
+The source for ``sqlite-lsm1`` is `hosted on GitHub
+<https://github.com/carlopires/python-lsm-db>`_.
 
 .. note::
-  If you encounter any bugs in the library, please `open an issue <https://github.com/coleifer/python-lsm-db/issues/new>`_, including a description of the bug and any related traceback.
+  If you encounter any bugs in the library, please `open an issue
+  <https://github.com/carlopires/python-lsm-db/issues/new>`_, including a
+  description of the bug and any related traceback.
 
 Contents:
 

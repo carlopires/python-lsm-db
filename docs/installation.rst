@@ -3,17 +3,18 @@
 Installation
 ============
 
-You can use ``pip`` to install ``lsm-db``:
+You can use ``pip`` to install ``sqlite-lsm1``:
 
 .. code-block:: console
 
-    pip install lsm-db
+    pip install sqlite-lsm1
 
-The project is hosted at https://github.com/coleifer/python-lsm-db and can be installed from source:
+The project is hosted at https://github.com/carlopires/python-lsm-db and can
+be installed from source:
 
 .. code-block:: console
 
-    git clone https://github.com/coleifer/python-lsm-db
+    git clone https://github.com/carlopires/python-lsm-db
     cd python-lsm-db
     python -m pip install .
 
@@ -22,7 +23,7 @@ The project is hosted at https://github.com/coleifer/python-lsm-db and can be in
     dependency and is installed automatically by modern versions of ``pip``
     in an isolated build environment.
 
-After installing lsm-db, run the unit tests from a source checkout:
+After installing ``sqlite-lsm1``, run the unit tests from a source checkout:
 
 .. code-block:: console
 

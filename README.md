@@ -1,4 +1,4 @@
-# Python LSM-DB
+# sqlite-lsm1
 
 Fast Python bindings for SQLite's
 [LSM1 key/value store](https://sqlite.org/src/dir?ci=trunk&name=ext/lsm1).
@@ -25,17 +25,20 @@ The sidecars are normally removed when the final connection closes cleanly.
 Install a published wheel with pip:
 
 ```console
-python -m pip install lsm-db
+python -m pip install sqlite-lsm1
 ```
 
 Building from source requires a C compiler. Cython is installed automatically
 in pip's isolated build environment:
 
 ```console
-git clone https://github.com/coleifer/python-lsm-db
+git clone https://github.com/carlopires/python-lsm-db
 cd python-lsm-db
 python -m pip install .
 ```
+
+The distribution is named `sqlite-lsm1`; the import remains `lsm` for
+compatibility with applications using the original package.
 
 ## Quick start
 
@@ -221,8 +224,8 @@ python -m pip install -r docs/requirements.txt
 sphinx-build -W -b html docs docs/_build/html
 ```
 
-The complete API reference is available at
-https://lsm-db.readthedocs.io/en/latest/api.html.
+The complete API reference is maintained in the
+[project documentation](https://github.com/carlopires/python-lsm-db/tree/master/docs).
 
 ## License
 
