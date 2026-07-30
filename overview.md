@@ -77,12 +77,13 @@ Range deletion excludes both boundary keys.
 
 ## Python API
 
-The wrapper exposes three main types:
+The wrapper exposes four main types:
 
 - `LSM`: connection, dictionary operations, transactions, configuration,
   and maintenance.
 - `Cursor`: ordered traversal and nearest-key seeking.
 - `Transaction`: context manager and decorator.
+- `WriteBatch`: buffered mixed-operation context manager.
 
 Notable behavior:
 
@@ -95,8 +96,15 @@ Notable behavior:
   end.
 - `SEEK_EQ`, `SEEK_LE`, `SEEK_GE`, and `SEEK_LEFAST` are exposed.
 - Individual writes automatically get their own transaction.
-- `insert_many()` streams a mapping or iterable of pairs through one atomic
-  nested transaction and returns the inserted row count.
+- `upsert_many()` and its `insert_many()` compatibility alias stream pairs
+  through bounded native chunks under one atomic transaction.
+- `delete_many()` and `apply_batch()` provide atomic point-delete and mixed
+  put/delete/range-delete operations.
+- `write_batch()` supports incrementally assembled mixed batches.
+- Sorted point batches validate strict byte ordering and use a right-edge
+  live-tree insertion path where possible.
+- `ingest_sorted()` materializes validated pairs and writes them directly as
+  one immutable, atomically published and checkpointed disk run.
 - `update()` delegates mappings to the same atomic bulk path.
 - Nested transactions are implemented with tree and log marks.
 - `incr()` stores a signed 64-bit big-endian integer, but its declared return
@@ -123,17 +131,17 @@ single-writer model.
 
 ## Verification
 
-An isolated PEP 517 wheel was built on Python 3.14.4:
+An isolated PEP 517 wheel was most recently built on Python 3.13.13:
 
 - The wheel built successfully.
 - The native extension imported successfully.
-- All 42 tests passed after the bulk-write and concurrency changes.
-- The working checkout remained untouched during exploration.
+- All 59 tests passed after the first-class bulk-operation changes.
 
-The tests cover dictionary behavior, atomic bulk writes, range traversal,
-cursors, nested transactions, transaction ownership, configuration,
-information counters, and an eight-thread write test. CI runs them on Linux
-with Python 3.9, 3.10, 3.12, and 3.14 through
+The tests cover dictionary behavior, atomic bulk writes and deletes, mixed
+batches, sorted-run ingestion, batch-log crash recovery, wide range deletion,
+range traversal, cursors, nested transactions, transaction ownership,
+configuration, information counters, and an eight-thread write test. CI runs
+them on Linux with Python 3.9, 3.10, 3.12, and 3.14 through
 [`.github/workflows/tests.yaml`](.github/workflows/tests.yaml). Tagged
 releases build Linux, macOS, and Windows wheels and publish directly to PyPI
 through [`.github/workflows/wheels.yaml`](.github/workflows/wheels.yaml).
@@ -182,17 +190,20 @@ results, sidecar files, atomic update guidance, maintenance behavior, and
 modern installation. The API reference includes `incr()`, correct seek
 semantics, and the current project version.
 
-### 7. Important reliability scenarios are untested
+### 7. Some reliability scenarios remain untested
 
-There are still no tests for crash recovery, power-loss simulations,
-multi-process access, or sustained flush/merge workloads. Release-tag wheel
-builds run the suite on Linux, macOS, and Windows, but non-Linux platforms are
-not tested on every push.
+Batch-log crash recovery now has a subprocess test, and sorted-run ingestion
+has sustained merge/reopen stress coverage. There are still no power-loss
+fault-injection tests or dedicated multi-process contention tests.
+Release-tag wheel builds run the suite on Linux, macOS, and Windows, but
+non-Linux platforms are not tested on every push.
 
 ## Overall assessment
 
-The core engine is sophisticated and the public wrapper is pleasantly small.
-The happy path is solid and fast, including current Python 3.14 support. The
-maintenance pass resolved the main wrapper-boundary, packaging, licensing,
-bulk-write, GIL, mutex, and documentation issues found during the audit. The
-remaining reliability test gaps deserve further work.
+The core engine is sophisticated and the public wrapper remains compact. Bulk
+operations now cross Python/C once per bounded chunk, release the GIL, use a
+framed batch WAL record, preserve cursors and calculate autowork once, and
+retain atomic rollback across all chunks. Sorted workloads additionally have
+validated append acceleration and a direct immutable-run ingestion path.
+Power-loss injection and multi-process contention remain worthwhile future
+test areas.

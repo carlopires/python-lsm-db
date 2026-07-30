@@ -42,17 +42,53 @@ Missing exact lookups raise :class:`KeyError`. Use :data:`lsm.SEEK_LE` and
     >>> db['k1xx', SEEK_GE]
     b'2'
 
-Use :py:meth:`lsm.LSM.insert_many` for an atomic bulk insert. It accepts a
-mapping or an iterable of ``(key, value)`` pairs, streams the input, and
-returns the number of rows inserted:
+Use :py:meth:`lsm.LSM.upsert_many` for atomic bulk inserts or replacements.
+It accepts a mapping or an iterable of ``(key, value)`` pairs, streams the
+input through bounded native chunks, and returns the number of rows:
 
 .. code-block:: python
 
     rows = ((f'key-{i}', f'value-{i}') for i in range(10_000))
-    assert db.insert_many(rows) == 10_000
+    assert db.upsert_many(rows, batch_size=4096) == 10_000
 
-If conversion or insertion fails, the complete batch is rolled back.
+If conversion or insertion fails, every chunk is rolled back.
+:py:meth:`lsm.LSM.insert_many` is a compatibility alias, and
 :py:meth:`lsm.LSM.update` provides the same atomic behavior for mappings.
+
+Point deletes and mixed operations are also first-class:
+
+.. code-block:: python
+
+    db.delete_many(['stale-1', 'stale-2'])
+    db.apply_batch([
+        ('put', 'account:1', 'active'),
+        ('delete', 'stale-3'),
+        ('delete_range', 'cache:0000', 'cache:9999'),
+    ])
+
+Use :py:meth:`lsm.LSM.write_batch` when assembling a mixed batch
+incrementally:
+
+.. code-block:: python
+
+    with db.write_batch(batch_size=4096) as batch:
+        batch.put('a', '1')
+        batch.delete('b')
+
+Pass ``sorted=True`` to ``upsert_many()``, ``delete_many()``, or
+``write_batch()`` when point-operation keys are strictly increasing. The
+order is validated across native chunks.
+
+For large, already sorted loads, :py:meth:`lsm.LSM.ingest_sorted` writes one
+immutable run directly to disk:
+
+.. code-block:: python
+
+    db.ingest_sorted(sorted_rows)
+
+Direct ingestion materializes its input, requires strictly increasing keys,
+and cannot run with open transactions or cursors. The completed run is
+published atomically and checkpointed before the method returns.
 
 Slices and iteration
 --------------------

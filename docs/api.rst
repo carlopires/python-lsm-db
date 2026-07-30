@@ -27,7 +27,12 @@ API Documentation
       tree_size,
       __enter__,
       insert,
+      upsert_many,
       insert_many,
+      delete_many,
+      apply_batch,
+      write_batch,
+      ingest_sorted,
       update,
       fetch,
       fetch_bulk,
@@ -51,6 +56,17 @@ API Documentation
       rollback,
       transaction,
       cursor
+
+
+.. autoclass:: WriteBatch
+    :members:
+      put,
+      upsert,
+      delete,
+      delete_range,
+      flush,
+      commit,
+      rollback
 
 
 .. autoclass:: Cursor
@@ -118,3 +134,9 @@ Values accepted by the :py:attr:`LSM.write_safety` property:
 * ``SAFETY_OFF``
 * ``SAFETY_NORMAL``
 * ``SAFETY_FULL``
+
+Mixed batch operation constants accepted by :py:meth:`LSM.apply_batch`:
+
+* ``BATCH_PUT``
+* ``BATCH_DELETE``
+* ``BATCH_DELETE_RANGE``

@@ -160,6 +160,12 @@
 **               * If the first byte was 0x09, an 8 byte checksum.
 **               * The key data.
 **
+**   LOG_BATCH:  * A single 0x0C or 0x0D byte,
+**               * The operation count, encoded as a varint,
+**               * The payload size, encoded as a varint,
+**               * If the first byte was 0x0D, an 8 byte checksum,
+**               * Repeated operation type, sizes, key and optional value.
+**
 **   Varints are as described in lsm_varint.c (SQLite 4 format).
 **
 ** CHECKSUMS:

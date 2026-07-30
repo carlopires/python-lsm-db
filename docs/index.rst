@@ -14,7 +14,8 @@ Features:
 
 * Embedded zero-conf database.
 * Keys support in-order traversal using cursors.
-* Atomic, streaming bulk inserts.
+* Atomic, streaming bulk upserts, deletes, and mixed operations.
+* Sorted-input acceleration and direct immutable-run ingestion.
 * Transactional (including nested transactions).
 * Single writer/multiple reader MVCC based transactional concurrency model.
 * Checksummed transaction log and crash recovery.

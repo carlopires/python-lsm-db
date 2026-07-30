@@ -11,6 +11,8 @@ Features:
 - Embedded, zero-configuration key/value database.
 - Ordered traversal and nearest-key lookups using cursors.
 - Nested transactions.
+- Atomic streaming upserts, deletes, and mixed write batches.
+- Validated sorted-write acceleration and direct sorted-run ingestion.
 - Single-writer/multiple-reader MVCC concurrency.
 - Checksummed transaction log and crash recovery.
 - Linux, macOS, and Windows wheel builds.
@@ -81,22 +83,61 @@ assert db["k1xx", SEEK_LE] == b"1"
 assert db["k1xx", SEEK_GE] == b"2"
 ```
 
-`insert_many()` atomically inserts either a mapping or an iterable of
-`(key, value)` pairs in a single transaction:
+`upsert_many()` atomically inserts or replaces either a mapping or an
+iterable of `(key, value)` pairs. `insert_many()` is a compatibility alias:
 
 ```python
 rows = ((f"key-{i}", f"value-{i}") for i in range(10_000))
-inserted = db.insert_many(rows)
+inserted = db.upsert_many(rows, batch_size=4096)
 assert inserted == 10_000
 ```
 
-The input is streamed rather than materialized. If conversion or insertion
-fails, the complete batch is rolled back. `update()` provides the same atomic
-behavior for mappings:
+The input is streamed through bounded native chunks while one outer
+transaction preserves all-or-nothing behavior. If conversion or a native
+write fails, every chunk is rolled back. `update()` provides the same
+behavior for mappings. Point deletes and ordered mixed operations have
+matching APIs:
 
 ```python
 db.update({"alpha": "a", "beta": "b"})
+db.delete_many(["old-1", "old-2"])
+
+db.apply_batch([
+    ("put", "account:1", "active"),
+    ("delete", "stale-key"),
+    ("delete_range", "session:0000", "session:9999"),
+])
 ```
+
+For incrementally assembled mixed batches, use the context manager. It
+flushes bounded chunks internally but commits them as one atomic unit:
+
+```python
+with db.write_batch(batch_size=4096) as batch:
+    batch.put("a", "1")
+    batch.delete("b")
+    batch.delete_range("cache:0000", "cache:9999")
+```
+
+When point-operation keys are strictly increasing, pass `sorted=True`.
+Ordering is validated across chunk boundaries and the native engine uses its
+right-edge append path once possible:
+
+```python
+db.upsert_many(sorted_rows, sorted=True)
+db.delete_many(sorted_keys, sorted=True)
+```
+
+For a large, already sorted initial load, `ingest_sorted()` bypasses the live
+tree and writes one immutable disk run:
+
+```python
+db.ingest_sorted(sorted_rows)
+```
+
+This direct path materializes the input before writing, requires strictly
+increasing keys, and cannot run with an open transaction or cursor. It
+publishes the completed run atomically and checkpoints it before returning.
 
 ### Slices and iteration
 
@@ -215,6 +256,12 @@ Run the tests from an installed source checkout:
 
 ```console
 python tests.py
+```
+
+Compare the write paths with the end-to-end durable bulk benchmark:
+
+```console
+python benchmarks/bulk_ops.py --rows 50000 --batch-size 4096
 ```
 
 Build the documentation with:

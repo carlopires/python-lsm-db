@@ -844,7 +844,8 @@ cdef class LSM(object):
 
         A mapping may be supplied directly. The batch uses one nested
         transaction, streams its input without materializing it, and rolls
-        back all rows if conversion or insertion fails.
+        back all rows if conversion or insertion fails. Set ``sorted=True``
+        for strictly increasing keys to enable the native append path.
 
         :returns: Number of rows inserted.
         """
@@ -931,7 +932,8 @@ cdef class LSM(object):
         Atomically delete an iterable of keys.
 
         Missing keys are accepted, matching :py:meth:`delete`. Input is
-        streamed through bounded native batches.
+        streamed through bounded native batches. Set ``sorted=True`` for
+        strictly increasing keys.
 
         :returns: Number of keys processed.
         """
@@ -978,7 +980,8 @@ cdef class LSM(object):
         * ``('delete_range', start, end)``
 
         Integer ``BATCH_*`` constants may be used instead of the string
-        operation names. Operations are applied in input order.
+        operation names. Operations are applied in input order. A sorted
+        batch accepts only point operations with strictly increasing keys.
 
         :returns: Number of operations processed.
         """
@@ -1051,7 +1054,8 @@ cdef class LSM(object):
         Return a buffered mixed-operation batch context manager.
 
         The context is committed atomically on normal exit and rolled back if
-        an exception escapes the block.
+        an exception escapes the block. Set ``sorted=True`` to validate and
+        accelerate strictly increasing point operations.
         """
         return WriteBatch.__new__(WriteBatch, self, batch_size, sorted)
 
