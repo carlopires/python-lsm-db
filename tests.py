@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -203,6 +204,43 @@ class TestLSM(BaseTestLSM):
             ValueError, self.db.apply_batch, operations, 1)
         self.assertMissing('first')
         self.assertEqual(self.db.transaction_depth, 0)
+
+    def test_batch_log_crash_recovery(self):
+        filename = tempfile.mktemp()
+        script = """
+import os
+import sys
+import lsm
+
+db = lsm.LSM(sys.argv[1], write_safety=2, autoflush=102400)
+db.apply_batch([
+    ('put', 'a', '1'),
+    ('put', 'b', '2'),
+    ('delete', 'b'),
+    ('delete_range', 'a', 'z'),
+    ('put', 'large', 'x' * 70000),
+    ('put', 'z', '9'),
+])
+os._exit(0)
+"""
+        try:
+            subprocess.run(
+                [sys.executable, '-c', script, filename], check=True)
+            recovered = lsm.LSM(filename)
+            try:
+                rows = list(recovered)
+                self.assertEqual(
+                    [key for key, value in rows],
+                    [b'a', b'large', b'z'])
+                self.assertEqual(rows[1][1], b'x' * 70000)
+            finally:
+                recovered.close()
+        finally:
+            for suffix in ('', '-log', '-shm'):
+                try:
+                    os.unlink(filename + suffix)
+                except FileNotFoundError:
+                    pass
 
     def test_write_batch(self):
         with self.db.write_batch(batch_size=1) as batch:

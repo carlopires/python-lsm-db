@@ -26,6 +26,7 @@
 **
 **   LOG_WRITE:  A key-value pair written to the database.
 **   LOG_DELETE: A delete key issued to the database.
+**   LOG_BATCH:  An ordered array of writes and deletes.
 **   LOG_COMMIT: A transaction commit.
 **
 ** And the following types of records for ancillary purposes..
@@ -205,6 +206,9 @@
 
 #define LSM_LOG_DRANGE       0x0A
 #define LSM_LOG_DRANGE_CKSUM 0x0B
+
+#define LSM_LOG_BATCH        0x0C
+#define LSM_LOG_BATCH_CKSUM  0x0D
 
 /* Require a checksum every 32KB. */
 #define LSM_CKSUM_MAXDATA (32*1024)
@@ -736,6 +740,99 @@ int lsmLogWrite(
 }
 
 /*
+** Append a complete native batch as one framed log record. The frame avoids
+** repeated jump/checksum/capacity work and lets recovery replay the batch in
+** its original order. Senseless range deletes are omitted, matching the
+** public range-delete API.
+*/
+int lsmLogWriteBatch(
+  lsm_db *pDb,
+  const lsm_batch_op *aOp,
+  int nOp,
+  int *piFailed
+){
+  LogWriter *pLog;
+  i64 nPayload64 = 0;
+  int nPayload;
+  int nActual = 0;
+  int nReq;
+  int bCksum = 0;
+  int rc = LSM_OK;
+  int i;
+  u8 *a;
+
+  if( pDb->bUseLog==0 ) return LSM_OK;
+  pLog = pDb->pLogWriter;
+
+  for(i=0; i<nOp; i++){
+    const lsm_batch_op *p = &aOp[i];
+    if( p->eType==LSM_BATCH_DELETE_RANGE
+     && pDb->xCmp(
+          (void *)p->pKey, p->nKey, (void *)p->pVal, p->nVal
+        )>=0
+    ){
+      continue;
+    }
+    nPayload64 += 1 + lsmVarintLen32(p->nKey) + p->nKey;
+    if( p->eType!=LSM_BATCH_DELETE ){
+      nPayload64 += lsmVarintLen32(p->nVal) + p->nVal;
+    }
+    nActual++;
+    if( nPayload64>0x7fffffe0 ){
+      if( piFailed ) *piFailed = i;
+      return LSM_FULL;
+    }
+  }
+  if( nActual==0 ) return LSM_OK;
+
+  nPayload = (int)nPayload64;
+  nReq = (
+      1 + lsmVarintLen32(nActual) + lsmVarintLen32(nPayload)
+      + 8 + nPayload
+  );
+  rc = jumpIfRequired(pDb, pLog, nReq, &bCksum);
+  if( (pLog->buf.n+nReq)>LSM_CKSUM_MAXDATA ) bCksum = 1;
+  if( rc==LSM_OK ) rc = lsmStringExtend(&pLog->buf, nReq);
+
+  if( rc==LSM_OK ){
+    a = (u8 *)&pLog->buf.z[pLog->buf.n];
+    *(a++) = LSM_LOG_BATCH | (u8)bCksum;
+    a += lsmVarintPut32(a, nActual);
+    a += lsmVarintPut32(a, nPayload);
+    if( bCksum ){
+      pLog->buf.n = (int)(a - (u8 *)pLog->buf.z);
+      rc = logCksumAndFlush(pDb);
+      a = (u8 *)&pLog->buf.z[pLog->buf.n];
+    }
+  }
+
+  for(i=0; rc==LSM_OK && i<nOp; i++){
+    const lsm_batch_op *p = &aOp[i];
+    if( p->eType==LSM_BATCH_DELETE_RANGE
+     && pDb->xCmp(
+          (void *)p->pKey, p->nKey, (void *)p->pVal, p->nVal
+        )>=0
+    ){
+      continue;
+    }
+    *(a++) = (u8)p->eType;
+    a += lsmVarintPut32(a, p->nKey);
+    if( p->eType!=LSM_BATCH_DELETE ) a += lsmVarintPut32(a, p->nVal);
+    memcpy(a, p->pKey, p->nKey);
+    a += p->nKey;
+    if( p->eType!=LSM_BATCH_DELETE ){
+      memcpy(a, p->pVal, p->nVal);
+      a += p->nVal;
+    }
+  }
+  if( rc==LSM_OK ){
+    pLog->buf.n = (int)(a - (u8 *)pLog->buf.z);
+    assert( pLog->buf.n<=pLog->buf.nAlloc );
+  }
+  return rc;
+}
+
+/*
 ** Append an LSM_LOG_COMMIT record to the database log.
 */
 int lsmLogCommit(lsm_db *pDb){
@@ -1074,6 +1171,63 @@ int lsmLogRecover(lsm_db *pDb){
             logReaderBlob(&reader, &buf1, nKey, &aKey, &rc);
             if( iPass==1 && rc==LSM_OK ){ 
               rc = lsmTreeInsert(pDb, aKey, nKey, NULL, -1);
+            }
+            break;
+          }
+
+          case LSM_LOG_BATCH:
+          case LSM_LOG_BATCH_CKSUM: {
+            int nOp = 0;
+            int nPayload = 0;
+            int iOp;
+
+            logReaderVarint(&reader, &buf1, &nOp, &rc);
+            logReaderVarint(&reader, &buf2, &nPayload, &rc);
+            if( nOp<0 || nPayload<0 ) rc = LSM_CORRUPT_BKPT;
+
+            if( eType==LSM_LOG_BATCH_CKSUM ){
+              logReaderCksum(&reader, &buf1, &bEof, &rc);
+            }else{
+              bEof = logRequireCksum(&reader, nPayload);
+            }
+            if( bEof ) break;
+
+            for(iOp=0; iOp<nOp && rc==LSM_OK; iOp++){
+              u8 eOp = 0;
+              int nKey = 0;
+              int nVal = -1;
+              u8 *aKey = 0;
+              u8 *aVal = 0;
+
+              logReaderByte(&reader, &eOp, &rc);
+              logReaderVarint(&reader, &buf1, &nKey, &rc);
+              if( eOp==LSM_BATCH_PUT || eOp==LSM_BATCH_DELETE_RANGE ){
+                logReaderVarint(&reader, &buf2, &nVal, &rc);
+              }else if( eOp!=LSM_BATCH_DELETE ){
+                rc = LSM_CORRUPT_BKPT;
+              }
+              if( nKey<0 || nVal < (eOp==LSM_BATCH_DELETE ? -1 : 0) ){
+                rc = LSM_CORRUPT_BKPT;
+              }
+
+              /*
+              ** Always copy the key out of the reader buffer. Reading a
+              ** large value may refill that buffer before the key is applied.
+              */
+              logReaderBlob(&reader, &buf1, nKey, 0, &rc);
+              aKey = (u8 *)buf1.z;
+              if( eOp!=LSM_BATCH_DELETE ){
+                logReaderBlob(&reader, &buf2, nVal, &aVal, &rc);
+              }
+              if( iPass==1 && rc==LSM_OK ){
+                if( eOp==LSM_BATCH_PUT ){
+                  rc = lsmTreeInsert(pDb, aKey, nKey, aVal, nVal);
+                }else if( eOp==LSM_BATCH_DELETE ){
+                  rc = lsmTreeInsert(pDb, aKey, nKey, 0, -1);
+                }else{
+                  rc = lsmTreeDelete(pDb, aKey, nKey, aVal, nVal);
+                }
+              }
             }
             break;
           }

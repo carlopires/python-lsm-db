@@ -663,12 +663,13 @@ static int doWriteOpCore(
   lsm_db *pDb,
   int bDeleteRange,
   int bAppend,
+  int bLog,
   const void *pKey, int nKey,     /* Key to write or delete */
   const void *pVal, int nVal      /* Value to write. Or nVal==-1 for a delete */
 ){
   int rc = LSM_OK;                /* Return code */
 
-  {
+  if( bLog ){
     int eType = (bDeleteRange ? LSM_DRANGE : (nVal>=0?LSM_WRITE:LSM_DELETE));
     rc = lsmLogWrite(pDb, eType, (void *)pKey, nKey, (void *)pVal, nVal);
   }
@@ -728,7 +729,7 @@ static int doWriteOp(
   if( rc==LSM_OK ){
     lsmSortedSaveTreeCursors(pDb);
     nBefore = lsmTreeSize(pDb);
-    rc = doWriteOpCore(pDb, bDeleteRange, 0, pKey, nKey, pVal, nVal);
+    rc = doWriteOpCore(pDb, bDeleteRange, 0, 1, pKey, nKey, pVal, nVal);
   }
   if( rc==LSM_OK ){
     rc = doWriteAutoWork(pDb, nBefore);
@@ -851,23 +852,25 @@ int lsm_write_batch_ex(
   if( rc==LSM_OK ){
     lsmSortedSaveTreeCursors(db);
     nBefore = lsmTreeSize(db);
+    rc = lsmLogWriteBatch(db, aOp, nOp, piFailed);
   }
 
   for(i=0; rc==LSM_OK && i<nOp; i++){
     const lsm_batch_op *p = &aOp[i];
     if( p->eType==LSM_BATCH_PUT ){
       rc = doWriteOpCore(
-          db, 0, (flags & LSM_BATCH_SORTED)!=0,
+          db, 0, (flags & LSM_BATCH_SORTED)!=0, 0,
           p->pKey, p->nKey, p->pVal, p->nVal
       );
     }else if( p->eType==LSM_BATCH_DELETE ){
       rc = doWriteOpCore(
-          db, 0, (flags & LSM_BATCH_SORTED)!=0, p->pKey, p->nKey, 0, -1
+          db, 0, (flags & LSM_BATCH_SORTED)!=0, 0,
+          p->pKey, p->nKey, 0, -1
       );
     }else if( db->xCmp(
           (void *)p->pKey, p->nKey, (void *)p->pVal, p->nVal
         )<0 ){
-      rc = doWriteOpCore(db, 1, 0, p->pKey, p->nKey, p->pVal, p->nVal);
+      rc = doWriteOpCore(db, 1, 0, 0, p->pKey, p->nKey, p->pVal, p->nVal);
     }
     if( rc!=LSM_OK && piFailed ) *piFailed = i;
   }

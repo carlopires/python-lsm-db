@@ -877,6 +877,7 @@ int lsmInfoFreelist(lsm_db *pDb, char **pzOut);
 */
 int lsmLogBegin(lsm_db *pDb);
 int lsmLogWrite(lsm_db *, int, void *, int, void *, int);
+int lsmLogWriteBatch(lsm_db *, const lsm_batch_op *, int, int *);
 int lsmLogReserve(lsm_db *, int);
 int lsmLogCommit(lsm_db *);
 void lsmLogEnd(lsm_db *pDb, int bCommit);
